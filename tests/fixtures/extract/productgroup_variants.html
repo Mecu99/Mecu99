@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Organic Cotton Tee | Loomcraft</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org/",
+  "@type": "WebPage",
+  "name": "Organic Cotton Tee",
+  "mainEntity": {
+    "@type": "ProductGroup",
+    "@id": "https://fashion.example/p/organic-tee#group",
+    "name": "Organic Cotton Tee",
+    "description": "Heavyweight tee in GOTS certified organic cotton.",
+    "url": "https://fashion.example/p/organic-tee",
+    "brand": {"@type": "Brand", "name": "Loomcraft"},
+    "productGroupID": "TEE-01",
+    "variesBy": ["https://schema.org/size", "https://schema.org/color"],
+    "hasVariant": [
+      {
+        "@type": "Product",
+        "sku": "TEE-01-S-WHT",
+        "gtin14": "00012345600012",
+        "name": "Organic Cotton Tee - S / White",
+        "size": "S",
+        "color": "White",
+        "url": "https://fashion.example/p/organic-tee?size=S&color=white",
+        "image": "https://fashion.example/img/tee-white.jpg",
+        "offers": {
+          "@type": "Offer",
+          "price": 24.90,
+          "priceCurrency": "EUR",
+          "availability": "https://schema.org/InStock",
+          "priceSpecification": {
+            "@type": "UnitPriceSpecification",
+            "priceType": "https://schema.org/StrikethroughPrice",
+            "price": 29.90,
+            "priceCurrency": "EUR"
+          },
+          "shippingDetails": {
+            "@type": "OfferShippingDetails",
+            "shippingRate": {"@type": "MonetaryAmount", "value": 4.95, "currency": "EUR"},
+            "shippingDestination": {"@type": "DefinedRegion", "addressCountry": "DE"}
+          }
+        }
+      },
+      {
+        "@type": "Product",
+        "sku": "TEE-01-M-WHT",
+        "gtin14": "00012345600029",
+        "name": "Organic Cotton Tee - M / White",
+        "size": "M",
+        "color": "White",
+        "url": "https://fashion.example/p/organic-tee?size=M&color=white",
+        "offers": {
+          "@type": "Offer",
+          "price": 22.90,
+          "priceCurrency": "EUR",
+          "availability": "https://schema.org/OutOfStock"
+        }
+      },
+      {
+        "@type": "Product",
+        "sku": "TEE-01-L-WHT",
+        "gtin14": "00012345600036",
+        "name": "Organic Cotton Tee - L / White",
+        "size": "L",
+        "color": "White",
+        "url": "https://fashion.example/p/organic-tee?size=L&color=white",
+        "offers": {
+          "@type": "Offer",
+          "price": "26.90",
+          "priceCurrency": "EUR",
+          "availability": "InStock"
+        }
+      }
+    ]
+  }
+}
+</script>
+</head>
+<body>
+<main class="pdp">
+  <h1>Organic Cotton Tee</h1>
+  <div class="pdp-price"><span class="price-current">€24.90</span> <s class="price-was">€29.90</s></div>
+</main>
+</body>
+</html>
