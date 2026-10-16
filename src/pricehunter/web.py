@@ -11,7 +11,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import load_config
-from .engine import build_snapshots, load_history, run_scan
+from .engine import build_snapshots, load_history, lookback_start, run_scan
 from .models import (
     Alert,
     AppConfig,
@@ -134,7 +134,8 @@ def create_app(config_path: str) -> FastAPI:
     def suggestions() -> list[PriceSuggestion]:
         return build_snapshots(state.config, state.storage)[1]
 
-    @app.get("/api/history/{sku}")
+    # ``path``: SKUs may contain "/" (sent as such or as %2F).
+    @app.get("/api/history/{sku:path}")
     def history(
         sku: str,
         competitor: str | None = None,
@@ -142,7 +143,7 @@ def create_app(config_path: str) -> FastAPI:
     ) -> list[Observation]:
         if state.config.product(sku) is None:
             raise HTTPException(404, f"unknown SKU {sku!r}")
-        return state.storage.history(sku, competitor, since=utcnow() - timedelta(days=days))
+        return state.storage.history(sku, competitor, since=lookback_start(days))
 
     @app.get("/api/alerts")
     def alerts(

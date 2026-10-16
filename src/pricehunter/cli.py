@@ -7,7 +7,6 @@ import json
 import re
 import shutil
 import tempfile
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
@@ -24,7 +23,13 @@ from . import __version__
 from .analyze import product_currency
 from .config import load_config
 from .demo import DemoMarket
-from .engine import build_snapshots, load_history, market_warnings, run_scan
+from .engine import (
+    build_snapshots,
+    load_history,
+    lookback_start,
+    market_warnings,
+    run_scan,
+)
 from .engine import probe as probe_page
 from .example_config import EXAMPLE_CONFIG
 from .models import (
@@ -35,7 +40,6 @@ from .models import (
     PriceSuggestion,
     ScanResult,
     ScanStats,
-    utcnow,
 )
 from .report import MAX_ALERTS_SHOWN, build_rows, render_html, write_csv, write_json
 from .storage import Storage
@@ -470,7 +474,7 @@ def history(
     cfg = _load(config)
     _check_skus(cfg, [sku])
     with Storage(cfg.settings.database) as storage:
-        rows = storage.history(sku, competitor, since=utcnow() - timedelta(days=days))
+        rows = storage.history(sku, competitor, since=lookback_start(days))
     if not rows:
         console.print(f"No price history for {sku} in the last {days:g} days.")
         return

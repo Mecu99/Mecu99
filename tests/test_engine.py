@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+from pricehunter import discover
 from pricehunter.demo import DemoMarket
 from pricehunter.engine import (
     FALLBACK_MAX_AGE,
@@ -371,14 +372,21 @@ async def test_a_shop_that_is_down_does_not_stop_the_others(
 ) -> None:
     await run_scan(config, storage, notify=False)
     market.set_offline("PretMic")
+    before = market.requests
     result = await run_scan(config, storage, notify=False, fetcher=fast_fetcher)
 
+    # Its robots.txt answers 503 too, which means "crawl nothing" (RFC 9309), so no page of
+    # PretMic is requested at all.
+    unavailable = "robots.txt unavailable (HTTP 503); retrying later"
     failed = [o for o in result.observations if o.competitor == "PretMic"]
-    assert len(failed) == 4 and all(o.error == "HTTP 503" for o in failed)
+    assert len(failed) == 4 and all(o.error == unavailable for o in failed)
     healthy = [o for o in result.observations if o.competitor != "PretMic"]
     assert len(healthy) == 9 and all(o.error is None and o.price for o in healthy)
     assert result.stats.errors == 4 and len(result.errors) == 4
-    assert all(e.startswith("PretMic: ") and "HTTP 503" in e for e in result.errors)
+    assert all(e.startswith("PretMic: ") and e.endswith(unavailable) for e in result.errors)
+    pretmic = market.base_url("PretMic")
+    asked = market.requests - before
+    assert [url for url in asked if url.startswith(pretmic)] == [f"{pretmic}/robots.txt"]
     # The market keeps PretMic's last good price until it answers again.
     sony = next(s for s in result.snapshots if s.sku == "SONY-XM5")
     assert {o.competitor for o in sony.offers} == {"MegaShop", "PretMic", "BudgetBay"}
@@ -898,6 +906,78 @@ async def test_rediscovery_replaces_weaker_listings(gtin: str | None, kept: list
         kept
     )
     assert result.snapshots[0].lowest == (D("799.00") if gtin else D("719.00"))
+
+
+SONY_SEARCH = "https://shop.example/search?q=Sony+WH-1000XM5"
+
+
+def _canonical_sony_page(price: str) -> str:
+    """The Sony page, naming ``SONY_URL`` as its canonical address."""
+    canonical = f'<link rel="canonical" href="{SONY_URL}">'
+    return _product_page("Sony WH-1000XM5", price, brand="Sony").replace("<head>", f"<head>{canonical}")
+
+
+async def test_one_page_reached_under_several_addresses_is_listed_once() -> None:
+    # Referral tags discovery does not strip, and another category path, all lead to one page
+    # that names its canonical address: one listing, so one reading and one alert per change.
+    aliases = [
+        f"{SONY_URL}?ref=similar_3",
+        f"{SONY_URL}?ref=home_7",
+        "https://shop.example/audio/casti/sony-wh-1000xm5",
+    ]
+    config = _shops(SONY, "Shop")
+    with Storage(":memory:") as storage:
+        for day, price in enumerate(("329.00", "299.00"), 1):
+            pages: dict[str, str | int] = dict.fromkeys([SONY_URL, *aliases], _canonical_sony_page(price))
+            pages[SONY_SEARCH] = "".join(f'<a href="{url}">Sony</a>' for url in aliases)
+            result = await _scan_pages(config, storage, pages)
+            assert [x.url for x in storage.listings()] == [aliases[0]], day
+            assert [o.url for o in result.observations] == [aliases[0]], day
+            assert len(result.alerts) == len({a.type for a in result.alerts}), day
+            assert {a.url for a in result.alerts} == {aliases[0]}, day
+        assert "price_drop" in {a.type for a in result.alerts}
+
+
+async def test_rediscovery_drops_a_listing_that_is_another_address_of_a_listed_page() -> None:
+    # Listings stored before duplicates were recognised collapse into one, and the search
+    # offering the same page under yet another address adds nothing.
+    kept, twin = f"{SONY_URL}?ref=similar_3", f"{SONY_URL}?ref=home_7"
+    config = _shops(SONY, "Shop", rediscover_after_hours=1)
+    pages: dict[str, str | int] = dict.fromkeys([SONY_URL, kept, twin], _canonical_sony_page("329.00"))
+    pages[f"{SONY_URL}?ref=search_9"] = pages[SONY_URL]
+    pages[SONY_SEARCH] = f'<a href="{SONY_URL}?ref=search_9">Sony</a>'
+    progress: list[str] = []
+    with Storage(":memory:") as storage:
+        for url, score in ((kept, 0.96), (twin, 0.95)):
+            storage.upsert_listing(
+                Listing(sku="XM5", competitor="Shop", url=url, match_score=score, match_reason="title")
+            )
+        storage.mark_discovered("XM5", "Shop", utcnow() - timedelta(hours=5))
+        result = await _scan_pages(config, storage, pages, progress=progress.append)
+        assert [x.url for x in storage.listings()] == [kept]
+    assert [o.url for o in result.observations] == [kept]
+    assert result.stats.listings_matched == 0 and result.errors == []
+    assert f"Shop: dropped {twin} for XM5: same page as {kept}" in progress
+
+
+async def test_a_sitemap_crawl_cut_short_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(discover, "MAX_SITEMAP_URLS", 1)
+    config = _shops(SONY, "Shop")
+    config.competitors[0].search_url = None
+    config.competitors[0].sitemap_url = "/sitemap.xml"
+    locs = (SONY_URL, "https://shop.example/p/sony-wh-1000xm5-silver")
+    sitemap = "<urlset>" + "".join(f"<url><loc>{u}</loc></url>" for u in locs) + "</urlset>"
+    pages: dict[str, str | int] = {"https://shop.example/sitemap.xml": sitemap, SONY_URL: SONY_PAGE}
+    with Storage(":memory:") as storage:
+        result = await _scan_pages(config, storage, pages)
+        assert [x.url for x in storage.listings()] == [SONY_URL]
+    assert result.errors == [
+        (
+            "Shop: sitemap discovery stopped at 1 candidate URLs; pages listed further on were"
+            " not considered (set search_url or product_url_pattern)"
+        )
+    ]
+    assert result.stats.errors == 1
 
 
 @pytest.mark.parametrize(

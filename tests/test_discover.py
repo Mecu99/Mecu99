@@ -9,9 +9,11 @@ import pytest
 
 from pricehunter import discover
 from pricehunter.discover import (
+    SitemapCache,
     build_queries,
     discover_candidates,
     extract_links,
+    page_key,
     parse_sitemap,
     rank_sitemap_urls,
     search_competitor,
@@ -208,6 +210,25 @@ def test_extract_links_keeps_meaningful_query_and_drops_tracking() -> None:
     assert extract_links(html, SEARCH_URL, competitor()) == [f"{BASE}/product.php?id=42"]
 
 
+def test_extract_links_drops_session_and_referral_params_but_keeps_identifiers() -> None:
+    html = """
+    <a href="/products/apple-iphone-15?_pos=1&amp;_sid=7c1f2e9ab&amp;_ss=r">Shopify search</a>
+    <a href="/products/apple-iphone-15?_pos=1&amp;_sid=a91d00b3c&amp;_ss=r">another session</a>
+    <a href="/products/apple-iphone-15?srsltid=AfmBOoqX">Google Shopping</a>
+    <a href="/telefon-apple-iphone-15/pd/DM6Z0FMBM/?ref=hdr-favorite_products">eMAG</a>
+    <a href="/telefon-apple-iphone-15/pd/DM6Z0FMBM/?X-Search-Id=abc&amp;X-Product-Id=123&amp;X-Section=search">
+      eMAG search</a>
+    <a href="/produit.php?ref=AB123&amp;ref_=nav_logo">a product reference, not a referral</a>
+    <a href="/products/apple-iphone-15?variant=4242&amp;PHPSESSID=x1">a variant</a>
+    """
+    assert extract_links(html, SEARCH_URL, competitor()) == [
+        f"{BASE}/products/apple-iphone-15",
+        f"{BASE}/telefon-apple-iphone-15/pd/DM6Z0FMBM/",
+        f"{BASE}/produit.php?ref=AB123",
+        f"{BASE}/products/apple-iphone-15?variant=4242",
+    ]
+
+
 SELECTOR_PAGE = """
 <div class="results">
   <div class="card"><h2 class="card-title"><a href="/p/iphone-15-128gb">iPhone 15</a></h2>
@@ -248,6 +269,51 @@ def test_extract_links_bad_selector_falls_back_to_heuristic() -> None:
 @pytest.mark.parametrize("html", ["", "<html></html>", "not html at all", "<a>no href</a>"])
 def test_extract_links_degenerate_input(html: str) -> None:
     assert extract_links(html, SEARCH_URL, competitor()) == []
+
+
+# --------------------------------------------------------------------------- page_key
+
+PAGE_URL = f"{BASE}/p/sony-wh-1000xm5-1001"
+
+
+def page(head: str = "") -> str:
+    return f"<html><head><title>Sony</title>{head}</head><body><h1>Sony</h1></body></html>"
+
+
+@pytest.mark.parametrize(
+    ("url", "head"),
+    [
+        (f"{PAGE_URL}?ref=search&utm_source=x", ""),
+        ("http://shop.example/p/sony-wh-1000xm5-1001/", ""),  # scheme, www., trailing slash
+        (f"{BASE}/p/sony-wh-1%30%300xm5-1001", ""),  # percent-encoding
+        (f"{PAGE_URL}?ref=similar_3", f'<link rel="canonical" href="{PAGE_URL}">'),
+        (f"{BASE}/audio/casti/sony-xm5", '<link rel="canonical" href="/p/sony-wh-1000xm5-1001">'),
+        (f"{PAGE_URL}?from=home", f'<meta property="og:url" content="{PAGE_URL}?utm_medium=og">'),
+    ],
+)
+def test_page_key_names_one_page_under_several_addresses(url: str, head: str) -> None:
+    assert page_key(page(head), url, competitor()) == "shop.example/p/sony-wh-1000xm5-1001"
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        '<link rel="canonical" href="https://other.example/p/sony-wh-1000xm5-1001">',
+        f'<link rel="canonical" href="{BASE}/">',  # every page claiming to be the home page
+        f'<link rel="canonical" href="{BASE}/categorie/casti">',
+        '<link rel="canonical" href="javascript:void(0)">',
+    ],
+)
+def test_page_key_ignores_canonicals_that_cannot_name_the_product(head: str) -> None:
+    url = f"{BASE}/p/sony-wh-1000xm4-1002"
+    assert page_key(page(head), url, competitor()) == "shop.example/p/sony-wh-1000xm4-1002"
+
+
+def test_page_key_keeps_the_params_that_select_a_page() -> None:
+    a = page_key("", f"{BASE}/product.php?id=42&utm_source=x&b=1", competitor())
+    b = page_key(page(), f"{BASE}/product.php?b=1&id=42", competitor())
+    assert a == b == "shop.example/product.php?b=1&id=42"
+    assert page_key("", f"{BASE}/product.php?id=43", competitor()) != a
 
 
 # --------------------------------------------------------------------------- search_competitor
@@ -500,6 +566,61 @@ async def test_sitemap_from_robots_txt_then_default_location() -> None:
     assert await sitemap_urls(fallback, competitor()) == [f"{BASE}/p/b-2"]
 
 
+async def test_sitemap_products_deep_in_a_huge_shop_are_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only URLs naming one of our products are held, so the rest of a big catalogue cannot
+    # fill the safety cap (a cap on all URLs used to hide products listed late).
+    monkeypatch.setattr(discover, "MAX_SITEMAP_URLS", 50)
+    comp = competitor(sitemap_url=f"{BASE}/sitemap.xml")
+    children = [f"{BASE}/sitemap-products-{i}.xml.gz" for i in (1, 2, 3)]
+    target = f"{BASE}/telefon-apple-iphone-15-128gb-black-p3999999.html"
+    blobs = {
+        child: gzip.compress(
+            urlset(*(f"{BASE}/produs/item-{i}-{n}-p{i}{n:06d}.html" for n in range(300))).encode()
+        )
+        for i, child in enumerate(children, 1)
+    }
+    blobs[children[2]] = gzip.compress(
+        urlset(*(f"{BASE}/produs/item-3-{n}-p3{n:06d}.html" for n in range(300)), target).encode()
+    )
+    fetcher = FakeFetcher(pages={f"{BASE}/sitemap.xml": sitemapindex(*children)}, blobs=blobs)
+    cache = SitemapCache([IPHONE])
+
+    assert await discover_candidates(fetcher, comp, IPHONE, limit=8, sitemap_cache=cache) == [target]
+    assert cache.problems == []
+    # Without a product cache the product filter still applies.
+    assert await discover_candidates(fetcher, comp, IPHONE, limit=8) == [target]
+    # Asked for every URL, the cap is what it is.
+    assert len(await sitemap_urls(fetcher, comp, max_urls=50)) == 50
+
+
+async def test_sitemap_safety_limits_are_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    comp = competitor(sitemap_url=f"{BASE}/sitemap.xml")
+    phones = [f"{BASE}/p/apple-iphone-15-{n}" for n in range(5)]
+    fetcher = FakeFetcher(
+        pages={
+            f"{BASE}/sitemap.xml": sitemapindex(f"{BASE}/a.xml", f"{BASE}/b.xml"),
+            f"{BASE}/a.xml": urlset(*phones[:3]),
+            f"{BASE}/b.xml": urlset(*phones[3:]),
+        }
+    )
+    advice = "pages listed further on were not considered (set search_url or product_url_pattern)"
+
+    monkeypatch.setattr(discover, "MAX_SITEMAP_URLS", 5)
+    exact = SitemapCache([IPHONE])
+    assert await exact.urls(fetcher, comp) == phones and exact.problems == []
+
+    monkeypatch.setattr(discover, "MAX_SITEMAP_URLS", 4)
+    full = SitemapCache([IPHONE])
+    assert await full.urls(fetcher, comp) == phones[:4]
+    assert full.problems == [f"shop: sitemap discovery stopped at 4 candidate URLs; {advice}"]
+
+    monkeypatch.setattr(discover, "MAX_SITEMAP_URLS", 100)
+    monkeypatch.setattr(discover, "MAX_SITEMAP_FILES", 2)
+    files = SitemapCache([IPHONE])
+    assert await files.urls(fetcher, comp) == phones[:3]
+    assert files.problems == [f"shop: sitemap discovery stopped after 2 sitemap files; {advice}"]
+
+
 # --------------------------------------------------------------------------- rank_sitemap_urls
 
 SITEMAP_URLS = [
@@ -594,7 +715,7 @@ async def test_discover_sitemap_is_fetched_once_per_competitor() -> None:
     comp = competitor(sitemap_url=f"{BASE}/sitemap.xml")
     sony = Product(sku="s", name="Sony WH-1000XM5 Headphones Black", brand="Sony")
     fetcher = _sitemap_fetcher()
-    cache: dict[str, list[str]] = {}
+    cache = SitemapCache([IPHONE, sony])
 
     iphone_urls = await discover_candidates(fetcher, comp, IPHONE, limit=2, sitemap_cache=cache)
     sony_urls = await discover_candidates(fetcher, comp, sony, limit=2, sitemap_cache=cache)
@@ -602,13 +723,17 @@ async def test_discover_sitemap_is_fetched_once_per_competitor() -> None:
     assert iphone_urls[0] == f"{BASE}/apple-iphone-15-128gb-black-p-1001.html"
     assert sony_urls == [f"{BASE}/sony-wh-1000xm5-headphones-black-123457"]
     assert fetcher.fetched(f"{BASE}/products.xml") == 1
-    assert len(cache["shop"]) == len(SITEMAP_URLS)  # /blog/ was dropped, the Sony URL added
+    # Only URLs naming one of the products are held: /blog/ and the Samsung phone are not.
+    kept = await cache.urls(fetcher, comp)
+    assert len(kept) == len(SITEMAP_URLS) - 1
+    assert not any("blog" in url or "samsung" in url for url in kept)
+    assert fetcher.fetched(f"{BASE}/products.xml") == 1 and cache.problems == []
 
 
 async def test_discover_concurrent_products_share_one_sitemap_crawl() -> None:
     comp = competitor(sitemap_url=f"{BASE}/sitemap.xml")
     fetcher = _sitemap_fetcher()
-    cache: dict[str, list[str]] = {}
+    cache = SitemapCache([IPHONE])
     results = await asyncio.gather(
         *(discover_candidates(fetcher, comp, IPHONE, limit=1, sitemap_cache=cache) for _ in range(5))
     )
@@ -625,9 +750,12 @@ async def test_discover_without_cache_still_works() -> None:
 
 async def test_discover_without_search_or_sitemap_returns_empty() -> None:
     fetcher = FakeFetcher()
-    cache: dict[str, list[str]] = {}
+    sony = Product(sku="s", name="Sony WH-1000XM5", brand="Sony")
+    cache = SitemapCache([IPHONE, sony])
     assert await discover_candidates(fetcher, competitor(), IPHONE, limit=5, sitemap_cache=cache) == []
-    assert cache == {"shop": []}  # remembered, so the next product does not retry
+    # Remembered, so the next product does not retry.
+    assert await discover_candidates(fetcher, competitor(), sony, limit=5, sitemap_cache=cache) == []
+    assert fetcher.fetched(f"{BASE}/robots.txt") == fetcher.fetched(f"{BASE}/sitemap.xml") == 1
 
 
 @pytest.mark.parametrize(
@@ -636,4 +764,5 @@ async def test_discover_without_search_or_sitemap_returns_empty() -> None:
     ids=["search", "sitemap", "robots"],
 )
 async def test_discover_never_raises(comp: Competitor) -> None:
-    assert await discover_candidates(ExplodingFetcher(), comp, IPHONE, limit=5, sitemap_cache={}) == []
+    cache = SitemapCache([IPHONE])
+    assert await discover_candidates(ExplodingFetcher(), comp, IPHONE, limit=5, sitemap_cache=cache) == []

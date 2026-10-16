@@ -14,14 +14,14 @@ import logging
 from collections.abc import Callable, Coroutine, Iterable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .alerts import dispatch, evaluate_alerts
 from .analyze import market_snapshot, missing_rates, product_currency, reprice
-from .discover import discover_candidates
+from .discover import SitemapCache, discover_candidates, page_key
 from .extract import VERDICTS, extract_offer
 from .fetch import Fetcher
 from .match import score_match
@@ -100,9 +100,9 @@ class _Run:
     discover: bool
     progress: Progress | None
     stats: ScanStats
+    sitemaps: SitemapCache
     fetcher: Fetcher = field(init=False)
     pages: dict[tuple[str, bool], asyncio.Task[FetchResult]] = field(default_factory=dict)
-    sitemaps: dict[str, list[str]] = field(default_factory=dict)
     observations: list[Observation] = field(default_factory=list)
     pairs: dict[str, list[tuple[Observation, Observation | None]]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -200,8 +200,10 @@ async def _discover(
     """Find candidate pages, keep the best matches as listings and remember when we looked.
 
     The pair's current listings compete with the new matches (and win ties), so a better page
-    replaces a weak listing, which is deactivated. Once a GTIN or MPN pins the exact item down,
-    title-only look-alikes (a used unit, another variant) are not kept next to it.
+    replaces a weak listing, which is deactivated. One page reached under several addresses
+    (``?ref=...``, another category path) is kept once, judged by its canonical URL. Once a
+    GTIN or MPN pins the exact item down, title-only look-alikes (a used unit, another
+    variant) are not kept next to it.
     """
     settings = run.settings
     listed = {listing.url for listing in listings}
@@ -210,7 +212,7 @@ async def _discover(
     )
     run.say(f"{competitor.name}: {len(candidates)} candidate(s) for {product.sku}")
 
-    async def check(url: str) -> tuple[MatchResult, str, ExtractedOffer] | None:
+    async def check(url: str) -> tuple[MatchResult, str, ExtractedOffer, str] | None:
         result = await run.get(url, competitor)
         run.stats.candidates_checked += 1
         if not result.ok or result.final_url in listed:
@@ -219,32 +221,55 @@ async def _discover(
         if offer.method in VERDICTS:  # a category grid, or variants we cannot tell apart
             run.say(f"{competitor.name}: skipped {result.final_url}: {VERDICTS[offer.method]}")
             return None
-        return score_match(product, offer), result.final_url, offer
+        key = page_key(result.html, result.final_url, competitor)
+        return score_match(product, offer), result.final_url, offer, key
 
-    checked = await asyncio.gather(*(check(url) for url in candidates if url not in listed))
-    found: dict[str, MatchResult] = {}
-    for match, url, offer in sorted(filter(None, checked), key=lambda c: -c[0].score):
+    async def identify(url: str) -> str:
+        """The page key of a current listing; _observe reads the page in this run anyway."""
+        result = await run.get(url, competitor)
+        if not result.ok:
+            return page_key("", url, competitor)
+        return page_key(result.html, result.final_url, competitor)
+
+    current = [listing for listing in listings if not listing.pinned]
+    checked, current_keys = await asyncio.gather(
+        asyncio.gather(*(check(url) for url in candidates if url not in listed)),
+        asyncio.gather(*(identify(listing.url) for listing in current)),
+    )
+    found: dict[str, tuple[MatchResult, str]] = {}
+    for match, url, offer, key in sorted(filter(None, checked), key=lambda c: -c[0].score):
         if match.score < settings.match_threshold or url in found:
             continue
         if _implausibly_cheap(settings, product, offer, match):
             price = f"{offer.price} {offer.currency or ''}".strip()
             run.say(f"{competitor.name}: skipped {url} for {product.sku}: {price} is too cheap")
             continue
-        found[url] = match
-    current = {
-        listing.url: MatchResult(score=listing.match_score, reason=listing.match_reason)
-        for listing in listings
-        if not listing.pinned
+        found[url] = match, key
+    known = {
+        listing.url: (MatchResult(score=listing.match_score, reason=listing.match_reason), key)
+        for listing, key in zip(current, current_keys)
     }
-    ranked = sorted({**current, **found}.items(), key=lambda item: -item[1].score)
+    # A listed page keeps its address (and so its price history); a new page its best-scored.
+    listed_first = [*sorted(known.items(), key=lambda item: -item[1][0].score), *found.items()]
+    pages: dict[str, str] = {}  # page key -> the address kept for that page
+    ranked: list[tuple[str, MatchResult]] = []
+    for url, (match, key) in listed_first:
+        if pages.setdefault(key, url) == url:
+            ranked.append((url, match))
+    ranked.sort(key=lambda item: -item[1].score)  # stable: listed pages win ties
     if any(match.reason in IDENTIFIED for _, match in ranked):
         ranked = [(url, match) for url, match in ranked if match.reason in IDENTIFIED]
     keep = dict(ranked[:MAX_MATCHES_PER_PAIR])
-    for url in (url for url in current if url not in keep):
+    for url, (_, key) in known.items():
+        if url in keep:
+            continue
         run.storage.deactivate_listing(product.sku, competitor.name, url)
-        run.say(f"{competitor.name}: replaced {url} for {product.sku} with a better match")
+        if pages[key] != url:
+            run.say(f"{competitor.name}: dropped {url} for {product.sku}: same page as {pages[key]}")
+        else:
+            run.say(f"{competitor.name}: replaced {url} for {product.sku} with a better match")
     for url, match in keep.items():
-        if url in current:
+        if url in known:
             continue
         run.storage.upsert_listing(
             Listing(
@@ -460,6 +485,8 @@ async def _collect(
                 )
             )
             run.stats.pages_fetched = fetcher.pages_fetched - pages_before
+        for problem in run.sitemaps.problems:
+            run.fail(problem)
     except Exception as exc:  # e.g. an invalid proxy URL; the stored data stays usable
         log.exception("scan %s aborted", run.run_id)
         run.fail(f"scan aborted: {type(exc).__name__}: {exc}")
@@ -517,7 +544,14 @@ async def run_scan(
     run_id = storage.start_run()
     stats = ScanStats(run_id=run_id, products=len(products))
     run = _Run(
-        config, storage, run_id, discover, progress, stats, errors=errors + competitor_errors
+        config,
+        storage,
+        run_id,
+        discover,
+        progress,
+        stats,
+        SitemapCache(products),
+        errors=errors + competitor_errors,
     )
     snapshots: list[MarketSnapshot] = []
     suggestions: list[PriceSuggestion] = []
@@ -565,11 +599,19 @@ def market_warnings(
     return _rate_errors(config, ((p, _readings(config, storage, p)) for p in products))
 
 
+def lookback_start(days: float) -> datetime | None:
+    """The moment ``days`` days ago; ``None`` (no limit) when that lies beyond the calendar."""
+    try:
+        return utcnow() - timedelta(days=days)
+    except OverflowError:
+        return None
+
+
 def load_history(
     config: AppConfig, storage: Storage, skus: list[str] | None = None, days: float | None = 30
 ) -> dict[str, list[Observation]]:
     """Successful observations per SKU (oldest first), limited to the last ``days`` days."""
-    since = utcnow() - timedelta(days=days) if days else None
+    since = lookback_start(days) if days else None
     return {p.sku: storage.history(p.sku, since=since) for p in _select_products(config, skus)[0]}
 
 

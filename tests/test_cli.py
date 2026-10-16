@@ -241,6 +241,10 @@ def test_history_lists_readings_with_sparklines(runner: CliRunner, demo_env: Dem
     assert "1,749.99 RON" in one.output and "MegaShop" not in one.output
     none = runner.invoke(app, ["history", "SONY-XM5", "-c", str(demo_env.config), "--days", "0"])
     assert "No price history" in none.output
+    forever = ["history", "SONY-XM5", "-c", str(demo_env.config), "--days", "1000000"]
+    everything = runner.invoke(app, forever)
+    assert everything.exit_code == 0, everything.output
+    assert "Price history: SONY-XM5" in everything.output
 
 
 def test_alerts_lists_recent_alerts(runner: CliRunner, demo_env: DemoEnv) -> None:

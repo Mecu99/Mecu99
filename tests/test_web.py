@@ -10,6 +10,8 @@ import threading
 import time
 import warnings
 from collections.abc import Iterator
+from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +22,16 @@ from bs4 import BeautifulSoup
 
 from pricehunter import web
 from pricehunter.demo import DemoMarket
-from pricehunter.models import AppConfig, ScanResult, ScanStats
+from pricehunter.models import (
+    AppConfig,
+    Observation,
+    Product,
+    ScanResult,
+    ScanStats,
+    Settings,
+    utcnow,
+)
+from pricehunter.storage import Storage
 from pricehunter.web import create_app
 
 with warnings.catch_warnings():  # starlette suggests httpx2, which is not a dependency here
@@ -144,6 +155,35 @@ def test_a_crashing_scan_is_reported_in_the_status(
     assert client.post("/api/scan").status_code == 202
     status = wait_for_scan(client)
     assert status["error"] == "RuntimeError: disk full" and status["running"] is False
+
+
+def test_history_serves_skus_with_slashes_and_any_look_back(tmp_path: Path) -> None:
+    db = tmp_path / "ph.db"
+    sku = "TV/55-Q80C"
+    config = AppConfig(
+        settings=Settings(database=str(db)), products=[Product(sku=sku, name="Samsung QE55Q80C")]
+    )
+    with Storage(str(db)) as storage:
+        storage.add_observation(
+            Observation(
+                sku=sku,
+                competitor="Shop",
+                url="https://shop.example/p/1",
+                price=Decimal("899.00"),
+                currency="EUR",
+                observed_at=utcnow() - timedelta(days=400),
+            )
+        )
+    with TestClient(create_app(str(write_config(config, tmp_path / "ph.yaml")))) as client:
+        for path in ("/api/history/TV/55-Q80C", "/api/history/TV%2F55-Q80C"):
+            year = client.get(path, params={"days": 500})
+            assert year.status_code == 200 and [o["price"] for o in year.json()] == ["899.00"]
+            assert client.get(path).json() == []  # 30 days by default
+        # A look-back beyond the calendar means "everything", not a server error.
+        for days in ("1000000", "1e300", "inf"):
+            everything = client.get("/api/history/TV/55-Q80C", params={"days": days})
+            assert everything.status_code == 200 and len(everything.json()) == 1, days
+        assert client.get("/api/history/TV/55").status_code == 404
 
 
 def test_bad_requests_are_rejected(client: TestClient) -> None:

@@ -164,19 +164,62 @@ async def test_robots_4xx_allows_all(status: int) -> None:
     assert len(hits) == 1
 
 
-@pytest.mark.parametrize("text,status", [(None, 200), ("oops", 503)])
-async def test_robots_errors_allow_and_are_cached_briefly(text: str | None, status: int) -> None:
+@pytest.mark.parametrize(
+    ("text", "status", "reason"),
+    [
+        (None, 200, "ConnectError: connection refused"),
+        ("oops", 500, "HTTP 500"),
+        ("oops", 503, "HTTP 503"),
+        ("slow down", 429, "HTTP 429"),
+    ],
+)
+async def test_robots_unreachable_disallows_all_and_is_rechecked_soon(
+    text: str | None, status: int, reason: str
+) -> None:
+    # RFC 9309 2.3.1.4: server or network errors mean "assume complete disallow".
     ft = FakeTime()
     transport, hits = robots_transport(text, status=status)
     cache = RobotsCache(error_ttl=60, clock=ft)
+    unavailable = f"robots.txt unavailable ({reason}); retrying later"
     async with httpx.AsyncClient(transport=transport) as client:
-        assert await cache.allowed(client, "https://shop.test/a", UA)
+        assert await cache.refusal(client, "https://shop.test/a", UA) == unavailable
         ft.now += 30
-        assert await cache.allowed(client, "https://shop.test/a", UA)
+        assert not await cache.allowed(client, "https://shop.test/b", UA)
         assert len(hits) == 1
         ft.now += 31
-        assert await cache.allowed(client, "https://shop.test/a", UA)
+        assert await cache.refusal(client, "https://shop.test/a", UA) == unavailable
     assert len(hits) == 2
+    assert cache.crawl_delay("https://shop.test/a", UA) is None
+
+
+async def test_robots_timeout_disallows_all() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    cache = RobotsCache()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        refusal = await cache.refusal(client, "https://shop.test/a", UA)
+    assert refusal == "robots.txt unavailable (ReadTimeout: timed out); retrying later"
+
+
+async def test_robots_unreachable_keeps_using_the_copy_read_before() -> None:
+    ft = FakeTime()
+    answers = [httpx.Response(200, text="User-agent: *\nDisallow: /x\nCrawl-delay: 2\n")]
+    answers += [httpx.Response(503), httpx.Response(503)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return answers.pop(0)
+
+    cache = RobotsCache(ttl=100, error_ttl=10, clock=ft)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await cache.refusal(client, "https://shop.test/x", UA) == "blocked by robots.txt"
+        ft.now += 101  # expired; the shop now answers 503, so the old rules stay in force
+        assert await cache.refusal(client, "https://shop.test/x", UA) == "blocked by robots.txt"
+        assert await cache.allowed(client, "https://shop.test/y", UA)
+        assert cache.crawl_delay("https://shop.test/y", UA) == 2.0
+        ft.now += 11  # re-checked after error_ttl, still with the previous copy
+        assert await cache.allowed(client, "https://shop.test/y", UA)
+    assert answers == []
 
 
 async def test_robots_success_is_cached_until_ttl() -> None:
@@ -233,6 +276,18 @@ async def test_fetcher_respects_robots() -> None:
     assert res.error == "blocked by robots.txt" and data == b""
     assert [r.url.path for r in seen] == ["/robots.txt", "/p/1"]
     assert f.pages_fetched == 1
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_fetcher_fetches_nothing_while_robots_txt_is_unreachable(status: int) -> None:
+    handler, seen = site({"/robots.txt": httpx.Response(status), "/checkout/private-area": html()})
+    async with make_fetcher(handler, respect_robots=True, max_retries=2) as f:
+        page = await f.get("https://shop.test/checkout/private-area", comp())
+        _, data = await f.get_bytes("https://shop.test/feed.xml.gz", comp())
+    assert (page.ok, page.status, page.html, data) == (False, 0, "", b"")
+    assert page.error == f"robots.txt unavailable (HTTP {status}); retrying later"
+    assert [r.url.path for r in seen] == ["/robots.txt"]
+    assert f.pages_fetched == 0
 
 
 async def test_fetcher_ignores_robots_when_disabled() -> None:

@@ -202,12 +202,17 @@ Pinned `competitor_urls` replace discovery for that pair.
   Otherwise links are taken from the results page: `search_result_link` when configured, or
   heuristics that drop navigation, cart, account, category, pagination and asset links.
 - Without a search, the sitemap is crawled once per run. Index files, `.gz` files and
-  robots.txt `Sitemap:` lines are followed, and product URLs are ranked by how well their slug
-  matches the product.
+  robots.txt `Sitemap:` lines are followed. Only URLs that mention one of the scanned products
+  are kept, so shops with millions of pages are covered too, and they are ranked by how well
+  their slug matches the product. If a safety limit stops the crawl early (200,000 matching
+  URLs or 500 sitemap files), the scan reports it as an error.
+- Tracking and session parameters (`utm_*`, `gclid`, Shopify `_pos`/`_sid`, eMAG `X-Search-*`,
+  `?ref=search`, ...) are dropped from candidate URLs.
 - Up to `max_candidates_per_competitor` candidates are fetched and scored. The best two at or
   above `match_threshold` become listings. Two are kept because shops sometimes list the same
-  item twice; any more would be noise. On rediscovery the current listings compete with the new
-  matches, so a better page replaces the weakest listing.
+  item twice; any more would be noise. One page reached under several addresses counts once,
+  judged by its `<link rel="canonical">`. On rediscovery the current listings compete with the
+  new matches, so a better page replaces the weakest listing.
 
 **2. Extraction.** Each page is read through these layers, most trusted first:
 
@@ -347,7 +352,9 @@ proxy with authentication before exposing it.
 PriceHunter is meant for monitoring publicly displayed prices, the way a shopper would see them.
 
 - Keep `respect_robots: true`. Pages disallowed by robots.txt are never fetched, and a
-  Crawl-delay slows PriceHunter down further.
+  Crawl-delay slows PriceHunter down further. While a site's robots.txt cannot be read (a
+  server error, 429 or network failure), nothing on that site is fetched, as RFC 9309 asks,
+  unless a copy read earlier is still at hand. It is retried after five minutes.
 - Keep `requests_per_minute` low (10–30 per site), scan only what you need, and scan no more
   often than prices actually change.
 - Use a truthful `user_agent` with contact details, so site owners can reach you.

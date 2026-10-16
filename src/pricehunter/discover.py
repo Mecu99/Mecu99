@@ -15,6 +15,7 @@ import re
 import zlib
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Protocol
 from urllib.parse import (
@@ -27,7 +28,7 @@ from urllib.parse import (
     urlunsplit,
 )
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, SoupStrainer, Tag
 from lxml import etree
 from soupsieve import SelectorSyntaxError
 
@@ -36,9 +37,11 @@ from .models import Competitor, ExtractedOffer, FetchResult, Product
 
 __all__ = [
     "PageFetcher",
+    "SitemapCache",
     "build_queries",
     "discover_candidates",
     "extract_links",
+    "page_key",
     "parse_sitemap",
     "rank_sitemap_urls",
     "search_competitor",
@@ -92,7 +95,21 @@ def build_queries(product: Product) -> list[str]:
 # --------------------------------------------------------------------------- URL hygiene
 
 _SKIP_SCHEMES = ("javascript:", "mailto:", "tel:", "data:", "sms:", "whatsapp:", "viber:")
-_TRACKING_PARAMS = frozenset({"gclid", "fbclid", "msclkid", "yclid", "mc_cid", "mc_eid", "_ga"})
+# Query parameters that only record how a visitor arrived (ads, mailings, the shop's own search
+# or recommendation slots) or carry a session; they never select another page. Pages reached
+# under params missing here are still told apart by their canonical URL (see page_key).
+_TRACKING_PARAMS = frozenset({
+    "gclid", "gclsrc", "gbraid", "wbraid", "dclid", "fbclid", "msclkid", "yclid", "ttclid",
+    "twclid", "igshid", "srsltid", "mc_cid", "mc_eid", "mkt_tok", "_ga", "_gl", "_hsenc", "_hsmi",
+    "_kx", "sc_cid", "spm", "scm", "trk", "ref_", "ref_src",
+    "_pos", "_sid", "_ss", "_psq", "_fid", "_v",  # Shopify search results
+    "pr_prod_strat", "pr_rec_id", "pr_rec_pid", "pr_ref_pid", "pr_seq",  # Shopify recommendations
+    "phpsessid", "jsessionid", "sessionid", "oscsid", "zenid",
+})  # fmt: skip
+# "x-": non-standard names such as eMAG's X-Search-Id, X-Product-Id and X-Section.
+_TRACKING_PREFIXES = ("utm_", "pf_rd_", "pd_rd_", "x-")
+# "?ref=search" tags a referral, but "?ref=AB123" may be the product reference itself.
+_REFERRAL_PARAMS = frozenset({"ref", "referrer", "referer"})
 _ASSET_EXT = re.compile(
     r"\.(?:jpe?g|png|gif|webp|avif|svg|ico|bmp|css|js|mjs|map|json|xml|txt|pdf|zip|gz|rar"
     r"|mp4|webm|mp3|woff2?|ttf|otf|eot)$"
@@ -148,6 +165,13 @@ def _compile(pattern: str | None) -> re.Pattern[str] | None:
         return None
 
 
+def _is_tracking(key: str, value: str) -> bool:
+    key = key.lower()
+    if key in _REFERRAL_PARAMS:
+        return not any(c.isdigit() for c in value)
+    return key in _TRACKING_PARAMS or key.startswith(_TRACKING_PREFIXES)
+
+
 def _clean_url(href: str, base: str, site: str, pattern: re.Pattern[str] | None) -> str | None:
     """Absolute same-site http(s) URL without fragment or tracking params, or ``None``."""
     href = href.strip()
@@ -161,7 +185,7 @@ def _clean_url(href: str, base: str, site: str, pattern: re.Pattern[str] | None)
     if parts.scheme not in ("http", "https") or _host_key(host) != site:
         return None
     params = parse_qsl(parts.query, keep_blank_values=True)
-    kept = [(k, v) for k, v in params if not k.lower().startswith("utm_") and k.lower() not in _TRACKING_PARAMS]
+    kept = [(k, v) for k, v in params if not _is_tracking(k, v)]
     query = parts.query if len(kept) == len(params) else urlencode(kept)
     url = urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, ""))
     if pattern is not None and not pattern.search(url):
@@ -206,6 +230,42 @@ def _is_junk(url: str) -> bool:
 
 def _dedupe(urls: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(urls))
+
+
+_SELF_REFERENCES = SoupStrainer(["link", "meta"])
+
+
+def _declared_address(html: str, url: str, site: str) -> str | None:
+    """The same-site ``<link rel=canonical>`` (else ``og:url``) of a page, if it names a page
+    that could be a product (a canonical pointing at the home page or a category is ignored)."""
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "lxml", parse_only=_SELF_REFERENCES)
+    for tag, attr in (
+        (soup.find("link", rel="canonical"), "href"),
+        (soup.find("meta", property="og:url"), "content"),
+    ):
+        value = tag.get(attr) if isinstance(tag, Tag) else None
+        address = _clean_url(value, url, site, None) if isinstance(value, str) else None
+        if address is not None and not _is_junk(address):
+            return address
+    return None
+
+
+def page_key(html: str, url: str, competitor: Competitor) -> str:
+    """Which page the ``html`` fetched from ``url`` is, to spot one page reached under several
+    addresses (``?ref=search``, a category path, a session id).
+
+    The page's own canonical address decides when it declares one on the competitor's site,
+    otherwise ``url`` does. Tracking and session parameters, parameter order, the scheme,
+    ``www.``, percent-encoding and a trailing slash do not count. A key, not a URL to fetch.
+    """
+    site = _host_key(urlsplit(competitor.base_url).hostname)
+    parts = urlsplit(_declared_address(html, url, site) or url)
+    params = parse_qsl(parts.query, keep_blank_values=True)
+    query = urlencode(sorted((k, v) for k, v in params if not _is_tracking(k, v)))
+    key = _host_key(parts.hostname) + unquote(parts.path).rstrip("/")
+    return f"{key}?{query}" if query else key
 
 
 # --------------------------------------------------------------------------- search pages
@@ -425,38 +485,123 @@ def _sitemap_priority(url: str) -> int:
     return 0 if _PRODUCT_SITEMAP.search(name) else 2 if _OTHER_SITEMAP.search(name) else 1
 
 
-async def sitemap_urls(
-    fetcher: PageFetcher, competitor: Competitor, max_urls: int = 50000, max_depth: int = 3
-) -> list[str]:
-    """Page URLs from the competitor's sitemaps, following index files up to ``max_depth``.
+# Safety valves of one sitemap crawl: URLs kept, sitemap files read and index levels followed.
+MAX_SITEMAP_URLS = 200_000
+MAX_SITEMAP_FILES = 500
+MAX_SITEMAP_DEPTH = 3
+_NARROW = "pages listed further on were not considered (set search_url or product_url_pattern)"
+_DIGIT_RUN = re.compile(r"\d{8,14}")
 
-    ``.gz`` files are fetched as bytes and decompressed (capped at 50 MB). Only same-site,
-    non-junk URLs matching ``product_url_pattern`` (when set) are kept.
-    """
+
+def _compact(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _url_path(url: str) -> str:
+    return unquote(urlsplit(url).path).lower()
+
+
+def _after_host(url: str) -> str:
+    """Lower-cased path and query of an absolute or root-relative URL, without parsing it."""
+    return unquote(url.split("://", 1)[-1].partition("/")[2]).lower()
+
+
+def _product_tokens(product: Product) -> set[str]:
+    return set(normalize_text(" ".join(filter(None, [product.brand, product.name, product.mpn]))).split())
+
+
+@dataclass(frozen=True)
+class _Terms:
+    """What a sitemap URL must mention to be worth scoring against one of some products: a word
+    (3+ characters, not a number) of a brand, name or MPN, an MPN, or a GTIN."""
+
+    words: frozenset[str]
+    mpns: frozenset[str]
+    gtins: frozenset[str]
+
+    @classmethod
+    def of(cls, products: Iterable[Product]) -> _Terms:
+        words: set[str] = set()
+        mpns: set[str] = set()
+        gtins: set[str] = set()
+        for product in products:
+            words.update(w for w in _product_tokens(product) if len(w) >= 3 and not w.isdigit())
+            if mpn := _compact(product.mpn or ""):
+                mpns.add(mpn)
+            if gtin := normalize_gtin(product.gtin):
+                gtins.add(gtin)
+        return cls(frozenset(words), frozenset(mpns), frozenset(gtins))
+
+    def has_gtin(self, path: str) -> bool:
+        return bool(self.gtins) and any(normalize_gtin(r) in self.gtins for r in _DIGIT_RUN.findall(path))
+
+    def mentioned_in(self, path: str) -> bool:
+        """Whether a lower-cased URL path (and query) names one of the words, MPNs or GTINs."""
+        if any(word in path for word in self.words) or self.has_gtin(path):
+            return True
+        compact = _compact(path)
+        return any(mpn in compact for mpn in self.mpns)
+
+
+async def _crawl(
+    fetcher: PageFetcher,
+    competitor: Competitor,
+    terms: _Terms | None,
+    max_urls: int,
+    max_depth: int,
+) -> tuple[list[str], str | None]:
+    """Page URLs from the competitor's sitemaps and, when a safety valve stopped the crawl, why."""
     site = _host_key(urlsplit(competitor.base_url).hostname)
     pattern = _compile(competitor.product_url_pattern)
     queue = deque((url, 0) for url in await _sitemap_roots(fetcher, competitor))
     visited: set[str] = set()
     found: dict[str, None] = {}
-    while queue and len(found) < max_urls:
+    while queue:
         url, depth = queue.popleft()
         if url in visited:
             continue
+        if len(visited) >= MAX_SITEMAP_FILES:
+            stop = f"stopped after {MAX_SITEMAP_FILES} sitemap files"
+            return list(found), f"{competitor.name}: sitemap discovery {stop}; {_NARROW}"
         visited.add(url)
         text = await _fetch_sitemap(fetcher, competitor, url)
         if text is None:
             continue
         pages, children = parse_sitemap(text)
         for page in pages:
+            if terms is not None and not terms.mentioned_in(_after_host(page)):
+                continue  # checked first: most URLs of a big shop are about other things
             clean = _clean_url(page, url, site, pattern)
-            if clean and not _is_junk(clean):
-                found.setdefault(clean)
-                if len(found) >= max_urls:
-                    break
+            if clean is None or clean in found or _is_junk(clean):
+                continue
+            if len(found) >= max_urls:
+                stop = f"stopped at {max_urls} candidate URLs"
+                return list(found), f"{competitor.name}: sitemap discovery {stop}; {_NARROW}"
+            found[clean] = None
         if depth < max_depth:
-            for child in sorted(children, key=_sitemap_priority):
-                queue.append((urljoin(url, child), depth + 1))
-    return list(found)
+            queue.extend((urljoin(url, c), depth + 1) for c in sorted(children, key=_sitemap_priority))
+    return list(found), None
+
+
+async def sitemap_urls(
+    fetcher: PageFetcher,
+    competitor: Competitor,
+    max_urls: int = MAX_SITEMAP_URLS,
+    max_depth: int = MAX_SITEMAP_DEPTH,
+    products: Iterable[Product] | None = None,
+) -> list[str]:
+    """Page URLs from the competitor's sitemaps, following index files up to ``max_depth``.
+
+    ``.gz`` files are fetched as bytes and decompressed (capped at 50 MB). Only same-site,
+    non-junk URLs matching ``product_url_pattern`` (when set) are kept and, given ``products``,
+    only those that mention one of them, so a shop of any size is covered without holding all
+    its URLs. ``max_urls`` and :data:`MAX_SITEMAP_FILES` are safety valves; hitting one is logged.
+    """
+    terms = None if products is None else _Terms.of(products)
+    urls, problem = await _crawl(fetcher, competitor, terms, max_urls, max_depth)
+    if problem:
+        log.warning(problem)
+    return urls
 
 
 # --------------------------------------------------------------------------- sitemap ranking
@@ -475,10 +620,9 @@ def _url_slug(url: str, keep: set[str]) -> str:
     extensions are dropped; a long number survives when it also appears in ``keep`` (e.g. a
     LEGO set number in our product name).
     """
-    path = unquote(urlsplit(url).path).lower()
     segments = [
         _ID_SUFFIX.sub("", _EXTENSION.sub("", s))
-        for s in path.split("/")
+        for s in _url_path(url).split("/")
         if s and s not in _PRODUCT_SEGMENTS
     ]
     words: list[str] = []
@@ -500,21 +644,18 @@ def rank_sitemap_urls(
     """
     if limit <= 0 or not urls:
         return []
-    product_text = normalize_text(" ".join(filter(None, [product.brand, product.name, product.mpn])))
-    keep = set(product_text.split())
-    words = {w for w in keep if len(w) >= 3 and not w.isdigit()}
-    mpn = re.sub(r"[^a-z0-9]", "", (product.mpn or "").lower())
+    terms = _Terms.of([product])
+    keep = _product_tokens(product)
+    mpn = _compact(product.mpn or "")
     models = model_tokens(f"{product.name} {product.mpn or ''}")
-    gtin = normalize_gtin(product.gtin)
 
     scored: list[tuple[float, int, str]] = []
     for index, url in enumerate(urls):
-        path = unquote(urlsplit(url).path).lower()
-        compact = re.sub(r"[^a-z0-9]", "", path)
-        if gtin and any(normalize_gtin(run) == gtin for run in re.findall(r"\d{8,14}", path)):
+        path = _url_path(url)
+        if terms.has_gtin(path):
             scored.append((1.0, index, url))
             continue
-        if not any(w in path for w in words) and not (mpn and mpn in compact):
+        if not terms.mentioned_in(path):
             continue  # cheap prefilter: no word of ours appears in the URL at all
         slug = _url_slug(url, keep)
         if not slug:
@@ -524,6 +665,7 @@ def rank_sitemap_urls(
             continue  # "husa-...", "...-refurbished": our identifiers in it must not lift it
         score = result.score
         if result.reason == "title":  # no conflict found, so identifiers in the URL can lift it
+            compact = _compact(path)
             if len(mpn) >= 5 and mpn in compact:
                 score = max(score, 0.97)
             elif any(m in compact for m in models):
@@ -536,30 +678,41 @@ def rank_sitemap_urls(
 
 # --------------------------------------------------------------------------- entry point
 
-# Sitemap downloads in flight, so concurrent products of one run share a single crawl.
-_inflight: dict[tuple[int, str], asyncio.Task[list[str]]] = {}
 
+class SitemapCache:
+    """Sitemap crawls shared by the products of one run.
 
-async def _cached_sitemap(
-    fetcher: PageFetcher, competitor: Competitor, cache: dict[str, list[str]] | None
-) -> list[str]:
-    if cache is None:
-        return await sitemap_urls(fetcher, competitor)
-    if competitor.name in cache:
-        return cache[competitor.name]
-    key = (id(cache), competitor.name)
-    task = _inflight.get(key)
-    if task is None:
+    Each competitor's sitemaps are read once, keeping only the URLs that mention one of
+    ``products`` (the prefilter of :func:`rank_sitemap_urls`), so even a shop with millions of
+    pages is covered without holding them all. ``problems`` gets a message for each crawl that
+    a safety valve stopped early.
+    """
 
-        async def load() -> list[str]:
-            urls = await sitemap_urls(fetcher, competitor)
-            cache[competitor.name] = urls
-            return urls
+    def __init__(self, products: Iterable[Product]) -> None:
+        products = list(products)
+        self._skus = frozenset(p.sku for p in products)
+        self._terms = _Terms.of(products)
+        self._crawls: dict[str, asyncio.Task[list[str]]] = {}
+        self.problems: list[str] = []
 
-        task = asyncio.ensure_future(load())
-        _inflight[key] = task
-        task.add_done_callback(lambda _: _inflight.pop(key, None))
-    return await asyncio.shield(task)
+    def covers(self, product: Product) -> bool:
+        return product.sku in self._skus
+
+    async def urls(self, fetcher: PageFetcher, competitor: Competitor) -> list[str]:
+        """The competitor's sitemap URLs that mention our products; callers share one crawl."""
+        task = self._crawls.get(competitor.name)
+        if task is None:
+            task = asyncio.ensure_future(self._load(fetcher, competitor))
+            self._crawls[competitor.name] = task
+        return await asyncio.shield(task)
+
+    async def _load(self, fetcher: PageFetcher, competitor: Competitor) -> list[str]:
+        urls, problem = await _crawl(
+            fetcher, competitor, self._terms, MAX_SITEMAP_URLS, MAX_SITEMAP_DEPTH
+        )
+        if problem:
+            self.problems.append(problem)
+        return urls
 
 
 async def discover_candidates(
@@ -567,14 +720,14 @@ async def discover_candidates(
     competitor: Competitor,
     product: Product,
     limit: int,
-    sitemap_cache: dict[str, list[str]] | None = None,
+    sitemap_cache: SitemapCache | None = None,
 ) -> list[str]:
     """Up to ``limit`` candidate product URLs for ``product`` on ``competitor``. Never raises.
 
     Uses the site search when ``search_url`` is configured, falling back to the sitemap only
     if search found nothing and a ``sitemap_url`` is explicitly configured. Without a search
-    URL the sitemap (configured, from robots.txt, or ``/sitemap.xml``) is crawled once per
-    competitor per ``sitemap_cache`` and ranked against the product.
+    URL the sitemap (configured, from robots.txt, or ``/sitemap.xml``) is crawled, once per
+    competitor when ``sitemap_cache`` covers the product, and ranked against the product.
     """
     found: list[str] = []
     try:
@@ -582,7 +735,10 @@ async def discover_candidates(
             found = await search_competitor(fetcher, competitor, product, limit)
             if found or not competitor.sitemap_url:
                 return found
-        urls = await _cached_sitemap(fetcher, competitor, sitemap_cache)
+        if sitemap_cache is not None and sitemap_cache.covers(product):
+            urls = await sitemap_cache.urls(fetcher, competitor)
+        else:
+            urls = await sitemap_urls(fetcher, competitor, products=[product])
         return rank_sitemap_urls(urls, product, limit)
     except Exception:
         log.exception("%s: discovery failed for %s", competitor.name, product.sku)

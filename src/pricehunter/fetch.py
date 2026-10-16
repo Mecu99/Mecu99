@@ -15,7 +15,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
 from types import TracebackType
@@ -43,6 +43,7 @@ DEFAULT_RPM = 60.0
 NETWORKIDLE_TIMEOUT_MS = 8_000
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 PLAYWRIGHT_MISSING = "playwright not installed: pip install pricehunter[js]"
+ROBOTS_BLOCKED = "blocked by robots.txt"
 DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
@@ -77,13 +78,22 @@ class RateLimiter:
             await self._sleep(start - now)
 
 
-class RobotsCache:
-    """Fetches and caches ``/robots.txt`` per origin (scheme + host + port).
+@dataclass(frozen=True, slots=True)
+class _Robots:
+    """One origin's robots.txt as last read."""
 
-    Status handling follows RFC 9309 for 4xx: any 4xx, *including 401/403*, means "no usable
-    robots.txt" and allows everything (``urllib.robotparser.RobotFileParser.read`` would
-    disallow all on 401/403 instead). 5xx and network errors also allow, but are only cached
-    for ``error_ttl`` seconds so the file is re-checked soon.
+    parser: RobotFileParser | None  # ``None``: no usable file, everything is allowed
+    expires: float
+    unreachable: str | None = None  # set when the file could not be read: nothing is allowed
+
+
+class RobotsCache:
+    """Fetches and caches ``/robots.txt`` per origin (scheme + host + port), as RFC 9309 says.
+
+    Any 4xx except 429, *including 401/403*, means "no usable robots.txt" and allows everything
+    (``urllib.robotparser.RobotFileParser.read`` would disallow all on 401/403 instead). A file
+    that cannot be read (5xx, 429, network error) disallows everything, unless a copy read
+    earlier is at hand; either way it is re-checked after ``error_ttl`` seconds.
     """
 
     def __init__(
@@ -92,33 +102,38 @@ class RobotsCache:
         self._ttl = ttl
         self._error_ttl = error_ttl
         self._clock = clock
-        # origin -> (parser, expires_at); a ``None`` parser allows everything.
-        self._entries: dict[str, tuple[RobotFileParser | None, float]] = {}
+        self._entries: dict[str, _Robots] = {}  # by origin
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def allowed(self, client: httpx.AsyncClient, url: str, user_agent: str) -> bool:
+    async def refusal(self, client: httpx.AsyncClient, url: str, user_agent: str) -> str | None:
+        """Why ``url`` must not be fetched now, or ``None`` when robots.txt allows it."""
         origin = _origin(url)
         if origin is None:
-            return True
-        parser = await self._parser(client, origin, user_agent)
-        return parser is None or parser.can_fetch(user_agent, url)
+            return None
+        entry = await self._entry(client, origin, user_agent)
+        if entry.unreachable is not None:
+            return entry.unreachable
+        if entry.parser is not None and not entry.parser.can_fetch(user_agent, url):
+            return ROBOTS_BLOCKED
+        return None
+
+    async def allowed(self, client: httpx.AsyncClient, url: str, user_agent: str) -> bool:
+        return await self.refusal(client, url, user_agent) is None
 
     def crawl_delay(self, url: str, user_agent: str) -> float | None:
-        """``Crawl-delay`` for ``user_agent`` from the cached file (call after :meth:`allowed`)."""
+        """``Crawl-delay`` for ``user_agent`` from the cached file (call after :meth:`refusal`)."""
         origin = _origin(url)
         entry = self._entries.get(origin) if origin else None
-        if entry is None or entry[0] is None:
+        if entry is None or entry.parser is None:
             return None
-        delay = entry[0].crawl_delay(user_agent)
+        delay = entry.parser.crawl_delay(user_agent)
         return float(delay) if delay else None
 
-    def _fresh(self, origin: str) -> tuple[RobotFileParser | None, float] | None:
+    def _fresh(self, origin: str) -> _Robots | None:
         entry = self._entries.get(origin)
-        return entry if entry is not None and entry[1] > self._clock() else None
+        return entry if entry is not None and entry.expires > self._clock() else None
 
-    async def _parser(
-        self, client: httpx.AsyncClient, origin: str, user_agent: str
-    ) -> RobotFileParser | None:
+    async def _entry(self, client: httpx.AsyncClient, origin: str, user_agent: str) -> _Robots:
         entry = self._fresh(origin)
         if entry is None:
             async with self._locks.setdefault(origin, asyncio.Lock()):
@@ -126,29 +141,33 @@ class RobotsCache:
                 if entry is None:
                     entry = await self._load(client, origin, user_agent)
                     self._entries[origin] = entry
-        return entry[0]
+        return entry
 
-    async def _load(
-        self, client: httpx.AsyncClient, origin: str, user_agent: str
-    ) -> tuple[RobotFileParser | None, float]:
+    async def _load(self, client: httpx.AsyncClient, origin: str, user_agent: str) -> _Robots:
         robots_url = f"{origin}/robots.txt"
         now = self._clock()
         try:
             async with client.stream("GET", robots_url, headers={"User-Agent": user_agent}) as resp:
-                if resp.status_code >= 500:
-                    log.debug(
-                        "robots.txt %s returned HTTP %s; allowing for now", robots_url, resp.status_code
-                    )
-                    return None, now + self._error_ttl
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    return self._unreachable(origin, f"HTTP {resp.status_code}", now)
                 if resp.status_code >= 400:
-                    return None, now + self._ttl
+                    return _Robots(None, now + self._ttl)
                 body, _ = await _read_capped(resp, ROBOTS_MAX_BYTES)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            log.debug("robots.txt %s unavailable (%s); allowing for now", robots_url, _describe(exc))
-            return None, now + self._error_ttl
+            return self._unreachable(origin, _describe(exc), now)
         parser = RobotFileParser(robots_url)
         parser.parse(body.decode("utf-8", errors="replace").splitlines())
-        return parser, now + self._ttl
+        return _Robots(parser, now + self._ttl)
+
+    def _unreachable(self, origin: str, reason: str, now: float) -> _Robots:
+        """RFC 9309 2.3.1.4: an unreachable robots.txt means complete disallow, though a copy
+        read earlier may still be used."""
+        log.debug("robots.txt of %s unavailable (%s)", origin, reason)
+        expires = now + self._error_ttl
+        previous = self._entries.get(origin)
+        if previous is not None and previous.unreachable is None:
+            return replace(previous, expires=expires)
+        return _Robots(None, expires, f"robots.txt unavailable ({reason}); retrying later")
 
 
 @dataclass(slots=True)
@@ -240,10 +259,10 @@ class Fetcher:
         if host is None:
             return _Outcome(_error(url, f"unsupported URL: {url!r}"))
         user_agent = self.settings.user_agent
-        if self.settings.respect_robots and not await self.robots.allowed(
-            next(self._client_cycle), url, user_agent
+        if self.settings.respect_robots and (
+            refusal := await self.robots.refusal(next(self._client_cycle), url, user_agent)
         ):
-            return _Outcome(_error(url, "blocked by robots.txt"))
+            return _Outcome(_error(url, refusal))
 
         headers = httpx.Headers({"User-Agent": user_agent, **DEFAULT_HEADERS})
         if competitor:
