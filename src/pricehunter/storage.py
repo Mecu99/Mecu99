@@ -20,7 +20,7 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
@@ -97,7 +97,10 @@ CREATE INDEX IF NOT EXISTS ix_alerts_created_at ON alerts (created_at);
 CREATE INDEX IF NOT EXISTS ix_alerts_sku ON alerts (sku, created_at);
 """
 
-_SUCCESSFUL = "o.error IS NULL AND o.price IS NOT NULL"
+# An error-free reading is the listing's current state, even without a price (an out-of-stock
+# page that hides it); price history only needs the readings that carry a price.
+_SUCCESSFUL = "o.error IS NULL"
+_PRICED = "o.error IS NULL AND o.price IS NOT NULL"
 
 _OBS_COLUMNS = (
     "run_id, sku, competitor, url, title, price, currency, availability, original_price,"
@@ -229,10 +232,11 @@ class Storage:
     def __init__(self, path: str) -> None:
         self.path = path
         in_memory = path == ":memory:"
+        target = path if in_memory else str(Path(path).expanduser())
         if not in_memory:
-            Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
+        self._conn = sqlite3.connect(target, timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         if not in_memory:
@@ -404,13 +408,17 @@ class Storage:
         *,
         before_run: int | None = None,
         successful_only: bool = True,
+        max_fallback_age: timedelta | None = None,
     ) -> list[Observation]:
         """The most recent observation per (sku, competitor, url), ordered by those keys.
 
         "Most recent" means greatest ``observed_at``, ties broken by insertion order.
-        Filters apply *before* picking the latest row, so with ``successful_only`` a
-        failed fetch falls back to the last good price of that URL, and ``before_run``
-        (``run_id < before_run``) rebuilds the market as a previous run saw it.
+        Filters apply *before* picking the latest row, so with ``successful_only`` (no
+        error; an out-of-stock reading without a price counts) a failed fetch falls back
+        to the last good reading of that URL, and ``before_run`` (``run_id < before_run``)
+        rebuilds the market as a previous run saw it. ``max_fallback_age`` drops such a
+        fallback once it is that much older than the URL's latest attempt, so a listing
+        that keeps failing stops counting.
 
         URLs whose listing has been deactivated (a rejected match or a dead page) are
         excluded. Observations with no listing row at all are kept, so ad-hoc checks
@@ -428,7 +436,12 @@ class Storage:
             clauses.append(_SUCCESSFUL)
         rows = self._query(
             f"""
-            SELECT * FROM (
+            SELECT latest.*, (
+                SELECT MAX(a.observed_at) FROM observations AS a
+                WHERE a.sku = latest.sku AND a.competitor = latest.competitor
+                    AND a.url = latest.url {"AND a.run_id < ?" if before_run is not None else ""}
+            ) AS last_attempt
+            FROM (
                 SELECT o.*, ROW_NUMBER() OVER (
                     PARTITION BY o.sku, o.competitor, o.url
                     ORDER BY o.observed_at DESC, o.id DESC
@@ -437,18 +450,24 @@ class Storage:
                 LEFT JOIN listings AS l
                     ON l.sku = o.sku AND l.competitor = o.competitor AND l.url = o.url
                 {_where(clauses)}
-            )
+            ) AS latest
             WHERE rn = 1
             ORDER BY sku, competitor, url
             """,
-            params,
+            # The attempts subquery comes first in the statement, so its parameter does too.
+            [*([before_run] if before_run is not None else []), *params],
         )
-        return [_obs_from_row(r) for r in rows]
+        found = [(_obs_from_row(r), _parse_ts(r["last_attempt"])) for r in rows]
+        return [
+            obs
+            for obs, last_attempt in found
+            if max_fallback_age is None or last_attempt - obs.observed_at <= max_fallback_age
+        ]
 
     def previous_observation(
         self, sku: str, competitor: str, url: str, before_id: int
     ) -> Observation | None:
-        """The latest successful observation of this URL with ``id < before_id``."""
+        """The latest error-free observation of this URL with ``id < before_id``."""
         rows = self._query(
             f"""
             SELECT o.* FROM observations AS o
@@ -463,8 +482,8 @@ class Storage:
     def history(
         self, sku: str, competitor: str | None = None, since: datetime | None = None
     ) -> list[Observation]:
-        """Successful observations of ``sku`` (any listing state), oldest first."""
-        clauses = ["o.sku = ?", _SUCCESSFUL]
+        """Priced, error-free observations of ``sku`` (any listing state), oldest first."""
+        clauses = ["o.sku = ?", _PRICED]
         params: list[Any] = [sku]
         if competitor is not None:
             clauses.append("o.competitor = ?")
