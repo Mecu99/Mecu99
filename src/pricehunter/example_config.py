@@ -53,7 +53,7 @@ competitors:
     search_url: /search?q={query}
     # Only URLs matching this regex are treated as product pages during discovery.
     product_url_pattern: "/product/"
-    # Currency to assume when a page shows none.
+    # Currency to assume when a page shows none; also what "$" or "lei" mean on this site.
     currency: EUR
     # Be polite: requests per minute to this host (robots.txt Crawl-delay can lower it).
     requests_per_minute: 20

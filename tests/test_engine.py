@@ -566,3 +566,85 @@ async def test_implausibly_cheap_title_match_is_not_listed() -> None:
     ]
     assert result.snapshots[0].lowest == D("1499.99")
     assert [a.new_price for a in result.alerts] == [D("1499.99")]
+
+
+def _variants_page(title: str, offers: object) -> str:
+    data = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": title,
+        "brand": "Apple",
+        "offers": offers,
+    }
+    return (
+        f'<html><head><script type="application/ld+json">{json.dumps(data)}</script></head>'
+        f'<body><main><h1>{title}</h1><p class="price">899,00 €</p></main></body></html>'
+    )
+
+
+PRICE_RANGE = {
+    "@type": "AggregateOffer",
+    "lowPrice": "899",
+    "highPrice": "1279",
+    "priceCurrency": "EUR",
+}
+IPHONE_256 = Product(
+    sku="IP15-256", name="Apple iPhone 15 256GB", brand="Apple", our_price=D("1029"), currency="EUR"
+)
+
+
+async def test_multi_variant_page_is_read_at_our_variants_price() -> None:
+    capacities = [("128GB", "899.00"), ("256GB", "1029.00"), ("512GB", "1279.00")]
+    offers = [
+        {
+            "@type": "Offer",
+            "name": capacity,
+            "price": price,
+            "priceCurrency": "EUR",
+            "availability": "https://schema.org/InStock",
+            "url": f"https://shop.example/apple-iphone-15-p-1001.html?variant={i}",
+        }
+        for i, (capacity, price) in enumerate(capacities)
+    ]
+    pages = {"/apple-iphone-15-p-1001.html": _variants_page("Apple iPhone 15", offers)}
+    result, listings = await _scan_search_shop(IPHONE_256, pages)
+
+    assert [urlsplit(x.url).path for x in listings] == ["/apple-iphone-15-p-1001.html"]
+    assert [o.price for o in result.observations] == [D("1029.00")]
+    assert result.alerts == []  # the 128GB price is no undercut of our 256GB
+
+
+async def test_listing_and_ambiguous_variant_pages_are_not_listed() -> None:
+    capacities = [("128gb", "899,00"), ("256gb", "1.029,00"), ("512gb", "1.279,00")]
+    tiles = "".join(
+        f'<div class="product-card"><a href="/p/{c}-p-{700 + i}.html">Apple iPhone 15 {c}</a>'
+        f'<span class="price">{p} €</span></div>'
+        for i, (c, p) in enumerate(capacities)
+    )
+    pages = {
+        "/apple-iphone-15-256gb-p-1001.html": _product_page(
+            "Apple iPhone 15 256GB", "1029.00", "EUR"
+        ),
+        "/telefoane/apple-iphone-15-p-1002.html": (
+            f"<html><body><main><h1>Apple iPhone 15</h1>{tiles}</main></body></html>"
+        ),
+        "/apple-iphone-15-p-1003.html": _variants_page("Apple iPhone 15", PRICE_RANGE),
+    }
+    result, listings = await _scan_search_shop(IPHONE_256, pages)
+
+    assert [urlsplit(x.url).path for x in listings] == ["/apple-iphone-15-256gb-p-1001.html"]
+    assert result.snapshots[0].lowest == D("1029.00")
+
+
+async def test_pinned_page_with_indistinguishable_variants_reports_why() -> None:
+    url = "https://shop.example/apple-iphone-15-p-1003.html"
+    pages = {
+        "/apple-iphone-15-p-1003.html": _variants_page("Apple iPhone 15", PRICE_RANGE)
+    }
+    pinned = IPHONE_256.model_copy(update={"competitor_urls": {"Shop": [url]}})
+    result, _ = await _scan_search_shop(pinned, pages)
+
+    [obs] = result.observations
+    assert obs.price is None and obs.method == "ambiguous"
+    assert obs.error is not None and obs.error.startswith("no price: variants at different prices")
+    assert result.alerts == []

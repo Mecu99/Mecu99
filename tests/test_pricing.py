@@ -318,3 +318,70 @@ def test_parse_decimal_float_has_no_binary_noise() -> None:
 )
 def test_parse_decimal_huge_values_are_plain_digits(value: object, expected: str) -> None:
     assert str(parse_decimal(value)) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "preferred", "amount", "currency"),
+    [
+        ("$449.99", "CAD", "449.99", "CAD"),
+        ("$449.99", "cad", "449.99", "CAD"),
+        ("$449.99", "EUR", "449.99", "USD"),  # EUR is no "$" currency
+        ("US$449.99", "CAD", "449.99", "USD"),  # explicit markers stay what they say
+        ("C$449.99", "AUD", "449.99", "CAD"),
+        ("17 499 lei", "MDL", "17499", "MDL"),
+        ("17 499 LEI", "MDL", "17499", "MDL"),
+        ("17 499 lei", "RON", "17499", "RON"),
+        ("¥1,200", "CNY", "1200", "CNY"),
+        ("1.299 kr", "NOK", "1299", "NOK"),
+        ("1.299 kr", None, "1299", None),  # "kr" alone names no currency
+        ("449.99 USD", "CAD", "449.99", "USD"),
+    ],
+)
+def test_parse_price_preferred_currency_decides_shared_markers(
+    text: str, preferred: str | None, amount: str, currency: str | None
+) -> None:
+    assert parse_price(text, preferred=preferred) == (D(amount), currency)
+
+
+def test_parse_price_default_currency_also_decides_shared_markers() -> None:
+    assert parse_price("$5", "CAD") == (D("5"), "CAD")
+    assert parse_price("5", preferred="CAD") == (D("5"), None)  # preferred is no fallback
+
+
+@pytest.mark.parametrize(
+    ("raw", "preferred", "expected"),
+    [
+        ("$", "CAD", "CAD"),
+        ("lei", "MDL", "MDL"),
+        ("USD", "CAD", "USD"),
+        ("€", "CAD", "EUR"),
+        ("$", None, "USD"),
+    ],
+)
+def test_currency_code_with_preferred(raw: str, preferred: str | None, expected: str) -> None:
+    assert currency_code(raw, preferred) == expected
+    assert detect_currency(raw, preferred) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "currency", "expected"),
+    [
+        ("12.990", "HUF", "12990"),
+        ("129.990", "HUF", "129990"),
+        ("1.299", "RON", "1299"),
+        ("1.299", "lei", "1299"),
+        ("19.990", "EUR", "19990"),
+        ("1.299", "KWD", "1.299"),  # three minor units: a real third decimal
+        ("1.299", "bhd", "1.299"),
+        ("1.299", None, "1.299"),  # unknown currency: '.' stays the decimal separator
+        ("0.990", "EUR", "0.990"),
+        ("1299.990", "EUR", "1299.990"),
+        ("12.99", "HUF", "12.99"),
+        ("1.299.000", "HUF", "1299000"),
+        (12.99, "HUF", "12.99"),
+    ],
+)
+def test_parse_decimal_dot_thousands_for_known_currency(
+    value: object, currency: str | None, expected: str
+) -> None:
+    assert parse_decimal(value, currency) == D(expected)

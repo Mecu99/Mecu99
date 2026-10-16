@@ -21,7 +21,7 @@ from typing import Any
 from .alerts import dispatch, evaluate_alerts
 from .analyze import market_snapshot, suggest_price
 from .discover import discover_candidates
-from .extract import extract_offer
+from .extract import VERDICTS, extract_offer
 from .fetch import Fetcher
 from .match import score_match
 from .models import (
@@ -151,8 +151,12 @@ class _Run:
             self.fail(f"{label}: {type(exc).__name__}: {exc}")
 
 
-def _extract(result: FetchResult, competitor: Competitor) -> ExtractedOffer:
-    return extract_offer(result.html, result.final_url, competitor.selectors, competitor.currency)
+def _extract(
+    result: FetchResult, competitor: Competitor, product: Product | None = None
+) -> ExtractedOffer:
+    return extract_offer(
+        result.html, result.final_url, competitor.selectors, competitor.currency, product
+    )
 
 
 def _needs_discovery(
@@ -198,7 +202,10 @@ async def _discover(
         run.stats.candidates_checked += 1
         if not result.ok or result.final_url in listed:
             return None
-        offer = _extract(result, competitor)
+        offer = _extract(result, competitor, product)
+        if offer.method in VERDICTS:  # a category grid, or variants we cannot tell apart
+            run.say(f"{competitor.name}: skipped {result.final_url}: {VERDICTS[offer.method]}")
+            return None
         return score_match(product, offer), result.final_url, offer
 
     checked = await asyncio.gather(*(check(url) for url in candidates if url not in listed))
@@ -252,7 +259,7 @@ async def _observe(run: _Run, product: Product, competitor: Competitor, listing:
         obs.error = error
         run.fail(f"{competitor.name}: {product.sku}: {listing.url}: {error}")
     else:
-        offer = _extract(result, competitor)
+        offer = _extract(result, competitor, product)
         match = PINNED if listing.pinned else score_match(product, offer)
         error = None
         if match.score < run.settings.match_threshold:
@@ -263,8 +270,9 @@ async def _observe(run: _Run, product: Product, competitor: Competitor, listing:
                 f" ({match.score:.2f})"
             )
         elif offer.price is None and offer.availability is not Availability.OUT_OF_STOCK:
-            error = NO_PRICE
-            run.fail(f"{competitor.name}: {product.sku}: {listing.url}: {NO_PRICE}")
+            verdict = VERDICTS.get(offer.method)
+            error = f"no price: {verdict}" if verdict else NO_PRICE
+            run.fail(f"{competitor.name}: {product.sku}: {listing.url}: {error}")
         obs = obs.model_copy(
             update={
                 "title": offer.title,
@@ -483,8 +491,8 @@ async def probe(
     if not result.ok:
         return result, ExtractedOffer(url=result.final_url), None
     offer = (
-        _extract(result, competitor)
+        _extract(result, competitor, product)
         if competitor is not None
-        else extract_offer(result.html, result.final_url)
+        else extract_offer(result.html, result.final_url, product=product)
     )
     return result, offer, score_match(product, offer) if product is not None else None

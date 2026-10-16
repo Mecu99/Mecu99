@@ -9,12 +9,15 @@ import pytest
 
 from pricehunter import extract as extract_mod
 from pricehunter.extract import (
+    AMBIGUOUS,
     CONFIDENCE,
+    LISTING,
     availability_from_text,
     extract_offer,
     load_jsonld,
 )
-from pricehunter.models import Availability, ExtractedOffer, SelectorConfig
+from pricehunter.match import score_match
+from pricehunter.models import Availability, ExtractedOffer, Product, SelectorConfig
 
 A = Availability
 D = Decimal
@@ -829,3 +832,431 @@ def test_unexpected_failure_returns_empty_offer(monkeypatch: pytest.MonkeyPatch)
     o = extract_offer("<html></html>", URL)
     assert o == ExtractedOffer(url=URL)
     assert (o.price, o.method, o.confidence) == (None, "none", 0.0)
+
+
+# --------------------------------------------------------------------------- variants and condition
+
+IPHONE = {"@context": "https://schema.org", "@type": "Product", "name": "Apple iPhone 15", "brand": "Apple"}
+SHOPIFY_URL = "https://shop.example/products/apple-iphone-15?_pos=1&_sid=s1x9&_ss=r"
+
+
+def _capacity_offers(*labels_prices: tuple[str | None, int]) -> list[dict[str, Any]]:
+    return [
+        {
+            "@type": "Offer",
+            "price": price,
+            "priceCurrency": "EUR",
+            "availability": "https://schema.org/InStock",
+            "url": f"https://shop.example/products/apple-iphone-15?variant={i}",
+            **({"name": label} if label else {}),
+        }
+        for i, (label, price) in enumerate(labels_prices)
+    ]
+
+
+def ours(name: str, **kw: Any) -> Product:
+    return Product(sku="OURS", name=name, brand="Apple", **kw)
+
+
+def test_product_hint_picks_our_variant_among_offers() -> None:
+    html = page({**IPHONE, "offers": _capacity_offers(("128GB", 899), ("256GB", 1029), ("512GB", 1279))})
+    assert extract_offer(html, SHOPIFY_URL).price == D("899")  # no hint: the lowest, as before
+    o = extract_offer(html, SHOPIFY_URL, product=ours("Apple iPhone 15 256GB"))
+    assert (o.method, o.price, o.currency) == ("jsonld", D("1029"), "EUR")
+
+
+def test_product_hint_prefers_the_variant_naming_our_colour_too() -> None:
+    offers = _capacity_offers(("128GB Black", 899), ("256GB Pink", 1049), ("256GB Black", 1029))
+    hint = ours("Apple iPhone 15 256GB Black")
+    o = extract_offer(page({**IPHONE, "offers": offers}), SHOPIFY_URL, product=hint)
+    assert o.price == D("1029")
+
+
+def test_product_hint_matches_variant_gtin() -> None:
+    offers = _capacity_offers((None, 899), (None, 1029))
+    offers[0]["gtin13"], offers[1]["gtin13"] = "0195949038488", "0195949038556"
+    hint = ours("iPhone", gtin="0195949038556")
+    o = extract_offer(page({**IPHONE, "offers": offers}), SHOPIFY_URL, product=hint)
+    assert (o.price, o.gtin) == (D("1029"), "0195949038556")
+
+
+def test_generic_product_hint_keeps_the_lowest_buyable_variant() -> None:
+    shoe = ours("Trail Runner Pro")
+    o = extract_offer(fixture("shopify_variants.html"), TestShopifyVariants.BASE, product=shoe)
+    assert (o.method, o.price, o.sku) == ("jsonld", D("94.95"), "TRP-42-BLK")
+    tee = ours("Organic Cotton Tee")
+    tee = extract_offer(fixture("productgroup_variants.html"), TestProductGroup.BASE, product=tee)
+    assert tee.price == D("24.90")
+
+
+def test_product_hint_picks_its_product_group_variant_even_when_sold_out() -> None:
+    hint = ours("Organic Cotton Tee M White")
+    o = extract_offer(fixture("productgroup_variants.html"), TestProductGroup.BASE, product=hint)
+    assert (o.price, o.availability, o.sku) == (D("22.90"), A.OUT_OF_STOCK, "TEE-01-M-WHT")
+
+
+@pytest.mark.parametrize(
+    "offers",
+    [
+        _capacity_offers(("128GB", 899), ("512GB", 1279)),  # our 256GB is not on offer
+        _capacity_offers((None, 899), (None, 1029), (None, 1279)),  # unnamed variants
+        {"@type": "AggregateOffer", "lowPrice": "899", "highPrice": "1279", "priceCurrency": "EUR"},
+    ],
+)
+def test_variants_that_cannot_be_told_apart_give_no_price(offers: Any) -> None:
+    # The visible range must not slip in through the heuristic layer either.
+    body = '<main><h1>Apple iPhone 15</h1><p class="price">899,00 € – 1.279,00 €</p></main>'
+    html = page({**IPHONE, "offers": offers}, body=body)
+    o = extract_offer(html, SHOPIFY_URL, product=ours("Apple iPhone 15 256GB"))
+    assert (o.method, o.price, o.currency, o.confidence) == (AMBIGUOUS, None, None, 0.0)
+    assert o.title == "Apple iPhone 15"
+
+
+def test_price_range_is_fine_for_a_product_the_page_title_names_fully() -> None:
+    hint = ours("Sony WH-1000XM5")
+    o = extract_offer(fixture("aggregate_offer.html"), "https://compara.example/x", product=hint)
+    assert (o.method, o.price) == ("jsonld", D("1349.99"))
+
+
+def test_new_offer_beats_cheaper_used_and_refurbished_ones() -> None:
+    offers = [
+        {"@type": "Offer", "price": price, "priceCurrency": "RON", "itemCondition": condition}
+        for price, condition in [
+            ("4199.99", "https://schema.org/NewCondition"),
+            ("3199.99", "RefurbishedCondition"),
+            ("2899.00", {"@id": "schema:UsedCondition"}),
+        ]
+    ]
+    o = extract_offer(page({**IPHONE, "name": "Apple iPhone 15 128GB Black", "offers": offers}), URL)
+    assert (o.price, o.title) == (D("4199.99"), "Apple iPhone 15 128GB Black")
+
+
+@pytest.mark.parametrize(
+    ("condition", "title"),
+    [
+        ("UsedCondition", "Apple iPhone 15 128GB (Used)"),
+        ("RefurbishedCondition", "Apple iPhone 15 128GB (Refurbished)"),
+    ],
+)
+def test_used_only_offer_is_flagged_in_the_title_for_the_matcher(condition: str, title: str) -> None:
+    offer = {"@type": "Offer", "price": "2899", "priceCurrency": "RON", "itemCondition": condition}
+    o = extract_offer(page({**IPHONE, "name": "Apple iPhone 15 128GB", "offers": offer}), URL)
+    assert (o.price, o.title) == (D("2899"), title)
+    assert score_match(ours("Apple iPhone 15 128GB"), o).score < 0.8
+
+
+def test_jsonld_instalment_price_specification_is_not_the_price() -> None:
+    offer = {
+        "@type": "Offer",
+        "priceCurrency": "RON",
+        "priceSpecification": [
+            {"@type": "UnitPriceSpecification", "price": 108.33, "billingDuration": 24, "unitCode": "MON",
+             "priceComponentType": "https://schema.org/Installment"},
+            {"@type": "UnitPriceSpecification", "price": 2599.99, "priceCurrency": "RON"},
+        ],
+    }  # fmt: skip
+    assert extract_offer(page(product(offers=offer)), URL).price == D("2599.99")
+
+
+# --------------------------------------------------------------------------- listing pages
+
+
+def _tiles(n: int = 3, cls: str = "product-card") -> str:
+    return "".join(
+        f'<div class="{cls}"><a href="/p/iphone-15-{i}"><h3>Apple iPhone 15 {i}</h3></a>'
+        f'<span class="price">{3 + i}.999,99 Lei</span></div>'
+        for i in range(n)
+    )
+
+
+def test_jsonld_item_list_page_is_a_listing() -> None:
+    items = [
+        {
+            "@type": "ListItem",
+            "position": i + 1,
+            "item": product(name=f"Apple iPhone 15 {c}", url=f"https://shop.example/p/{c}"),
+        }
+        for i, c in enumerate(["128gb", "256gb", "512gb"])
+    ]
+    html = page(
+        {"@context": "https://schema.org", "@type": "ItemList", "itemListElement": items},
+        body=f"<main><h1>Apple iPhone 15</h1>{_tiles()}</main>",
+    )
+    category = "https://shop.example/telefoane/apple-iphone-15/"
+    o = extract_offer(html, category, product=ours("Apple iPhone 15 256GB"))
+    assert (o.method, o.price, o.currency, o.availability) == (LISTING, None, None, A.UNKNOWN)
+    assert o.title == "Apple iPhone 15"
+
+
+def test_collection_page_type_is_a_listing() -> None:
+    html = page({"@type": "CollectionPage", "name": "Phones"}, body=f"<main>{_tiles()}</main>")
+    assert extract_offer(html, URL).method == LISTING
+
+
+def test_several_products_living_elsewhere_make_a_listing() -> None:
+    laptops = [product(name=f"Laptop {i}", url=f"https://shop.example/p/laptop-{i}") for i in range(3)]
+    o = extract_offer(page(*laptops), "https://shop.example/laptops/")
+    assert (o.method, o.price) == (LISTING, None)
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        # A related product next to the page's own product (matched by its canonical URL).
+        page(
+            product(name="Main", url="https://shop.example/main"),
+            product(name="Rel", url="https://shop.example/rel"),
+            head='<link rel="canonical" href="https://shop.example/main">',
+        ),
+        # One product per variant, all on this page.
+        page(*(product(name=f"V{i}", url=f"{URL}?variant={i}") for i in (1, 2))),
+        # The page's product next to an item list of related products.
+        page(product(), {"@type": "ItemList", "itemListElement": [{"url": "/a"}, {"url": "/b"}]}),
+    ],
+)
+def test_product_pages_with_other_items_are_not_listings(html: str) -> None:
+    assert extract_offer(html, URL).method == "jsonld"
+
+
+def test_grid_of_priced_tiles_without_structured_data_is_a_listing() -> None:
+    o = extract_offer(f"<main><h1>Telefoane</h1><div class='grid'>{_tiles(4)}</div></main>", URL)
+    assert (o.method, o.price, o.title) == (LISTING, None, "Telefoane")
+
+
+@pytest.mark.parametrize("before", [True, False])
+def test_product_page_with_unmarked_tiles_keeps_its_own_price(before: bool) -> None:
+    main = '<h1>Main</h1><div class="product-price">1.299,99 Lei</div>'
+    grid = f'<section><h2>Others</h2><div class="grid">{_tiles(4, "card")}</div></section>'
+    o = extract_offer(f"<main>{grid + main if before else main + grid}</main>", URL)
+    assert (o.method, o.price) == ("heuristic", D("1299.99"))
+
+
+def test_layout_rows_with_links_are_no_grid() -> None:
+    rows = (
+        '<div class="row"><a href="/c/phones">Phones</a></div>'
+        '<div class="row"><a href="/brand/apple">Apple</a><span class="price">1.299,99 Lei</span></div>'
+        '<div class="row"><a href="/help">Help</a></div>'
+    )
+    assert extract_offer(f"<main><h1>Main</h1>{rows}</main>", URL).price == D("1299.99")
+
+
+# --------------------------------------------------------------------------- split prices in microdata
+
+
+@pytest.mark.parametrize(
+    ("shown", "expected"), [("2.599<sup>99</sup>", "2599.99"), ("799<sup>99</sup>", "799.99")]
+)
+def test_microdata_price_with_sup_decimals(shown: str, expected: str) -> None:
+    html = (
+        '<div itemscope itemtype="https://schema.org/Product"><h1 itemprop="name">Telefon</h1>'
+        '<div itemprop="offers" itemscope itemtype="https://schema.org/Offer">'
+        f'<p class="product-new-price" itemprop="price">{shown} '
+        '<span itemprop="priceCurrency" content="RON">Lei</span></p></div></div>'
+    )
+    o = extract_offer(html, URL)
+    assert (o.method, o.price, o.currency) == ("microdata", D(expected), "RON")
+
+
+# --------------------------------------------------------------------------- amounts that are not the price
+
+
+@pytest.mark.parametrize(
+    ("body", "price", "currency"),
+    [
+        ('<div class="product-installments"><span class="installment-price">de la 108,33 Lei/lună'
+         '</span></div><div class="product-price"><span class="price">2.599,99 Lei</span></div>',
+         "2599.99", "RON"),
+        ('<div class="monthly-price">or $41.58/mo. for 24 months</div>'
+         '<div class="price-box"><span class="price">$999.99</span></div>', "999.99", "USD"),
+        ('<div class="product-price">de la 108,33 Lei/lună sau 2.599,99 Lei</div>', "2599.99", "RON"),
+        ('<div class="product-price">În 24 rate de 108,33 lei. Total 2.599,99 lei</div>', "2599.99", "RON"),
+        ('<div class="shipping-price">Livrare: 19,99 Lei</div><div class="product-price">149,99 Lei</div>',
+         "149.99", "RON"),
+        ('<div class="product-price">Livrare: 19,99 Lei <b>149,99 Lei</b></div>', "149.99", "RON"),
+        ('<div class="product-price"><span class="savings">Save $200.00</span> '
+         '<span class="sale">$999.99</span></div>', "999.99", "USD"),
+        ('<div class="product-price"><span class="discount">Economisești 50,00 Lei</span> '
+         '<span class="current">199,99 Lei</span></div>', "199.99", "RON"),
+        ('<div class="price-club">Preț Club: 1.199,99 Lei</div>'
+         '<div class="product-price">1.299,99 Lei</div>', "1299.99", "RON"),
+        ('<div class="product-price">Preț Club: 1.199,99 Lei <b>1.299,99 Lei</b></div>', "1299.99", "RON"),
+        ('<div class="product-price"><span class="price-excl-tax">1.092,43 Lei fără TVA</span></div>'
+         '<div class="product-price"><span class="price-incl-tax">1.299,99 Lei</span></div>',
+         "1299.99", "RON"),
+        ('<div class="product-price">1.092,43 Lei fără TVA <b>1.299,99 Lei</b></div>', "1299.99", "RON"),
+        ('<div class="product-price">Cel mai mic preț din ultimele 30 de zile: 1.199,99 Lei '
+         "<b>1.299,99 Lei</b></div>", "1299.99", "RON"),
+    ],
+)  # fmt: skip
+def test_heuristic_skips_instalment_shipping_savings_member_and_net_amounts(
+    body: str, price: str, currency: str
+) -> None:
+    o = extract_offer(f"<html><body><main><h1>Telefon</h1>{body}</main></body></html>", URL)
+    assert (o.method, o.price, o.currency) == ("heuristic", D(price), currency)
+
+
+WOO_8_SALE = (
+    '<div class="summary entry-summary"><p class="price"><del aria-hidden="true">'
+    '<span class="woocommerce-Price-amount amount"><bdi>1.499,99&nbsp;'
+    '<span class="woocommerce-Price-currencySymbol">lei</span></bdi></span></del> '
+    '<span class="screen-reader-text">Original price was: 1.499,99&nbsp;lei.</span>'
+    '<ins aria-hidden="true"><span class="woocommerce-Price-amount amount"><bdi>1.299,99&nbsp;'
+    '<span class="woocommerce-Price-currencySymbol">lei</span></bdi></span></ins>'
+    '<span class="screen-reader-text">Current price is: 1.299,99&nbsp;lei.</span></p></div>'
+)
+DAWN_SALE = (
+    '<div class="product"><div class="price price--on-sale"><div class="price__container">'
+    '<div class="price__regular"><span class="visually-hidden visually-hidden--inline">Regular price</span>'
+    '<span class="price-item price-item--regular">€399,00</span></div><div class="price__sale">'
+    '<span class="visually-hidden visually-hidden--inline">Regular price</span>'
+    '<span><s class="price-item price-item--regular">€399,00</s></span>'
+    '<span class="visually-hidden visually-hidden--inline">Sale price</span>'
+    '<span class="price-item price-item--sale price-item--last">€329,00</span></div></div></div></div>'
+)
+
+
+@pytest.mark.parametrize(
+    ("body", "price", "original"),
+    [
+        (WOO_8_SALE, "1299.99", "1499.99"),
+        (WOO_8_SALE.replace('class="woocommerce-Price-amount amount"', ""), "1299.99", "1499.99"),
+        (DAWN_SALE, "329.00", "399.00"),
+        ('<div class="price"><span class="pret-vechi">1.499,99 Lei</span> '
+         '<span class="pret-nou">1.299,99 Lei</span></div>', "1299.99", None),
+        ('<div class="product-price">PRP: 1.499,99 Lei <b>1.299,99 Lei</b></div>', "1299.99", None),
+        ('<div class="product-price">UVP 1.499,99 € <b>1.299,99 €</b></div>', "1299.99", None),
+        ('<div class="product-price">Was $1,199.99 Now $999.99</div>', "999.99", None),
+        ('<div class="product-price">Antes: 1.499,99 € Ahora 1.299,99 €</div>', "1299.99", None),
+    ],
+)  # fmt: skip
+def test_heuristic_reads_the_sale_price_of_common_sale_markup(
+    body: str, price: str, original: str | None
+) -> None:
+    o = extract_offer(f"<html><body><main><h1>X</h1>{body}</main></body></html>", URL)
+    assert (o.method, o.price) == ("heuristic", D(price))
+    assert o.original_price == (D(original) if original else None)
+
+
+def test_heuristic_still_reads_split_price_parts_as_one_price() -> None:
+    body = (
+        '<div class="product-price"><span class="price-amount">1.299</span>'
+        '<sup class="price-decimals">99</sup> <span class="price-currency">Lei</span></div>'
+    )
+    assert extract_offer(f"<main><h1>X</h1>{body}</main>", URL).price == D("1299.99")
+
+
+# --------------------------------------------------------------------------- selectors on price blocks
+
+
+@pytest.mark.parametrize(
+    ("html", "css"),
+    [
+        ('<div class="product-price"><del>1.499,99 Lei</del> <span class="current">1.299,99 Lei</span></div>',
+         ".product-price"),
+        ('<div class="product-page-pricing"><p class="product-old-price"><s>1.499<sup>99</sup> Lei</s></p>'
+         '<p class="product-new-price">1.299<sup>99</sup> Lei</p></div>', ".product-page-pricing"),
+        ('<div class="buy"><span class="savings">Economisești 200,00 Lei</span> 1.299,99 Lei</div>', ".buy"),
+    ],
+)  # fmt: skip
+def test_selector_price_block_skips_struck_and_savings_amounts(html: str, css: str) -> None:
+    o = extract_offer(html, URL, SelectorConfig(price=css))
+    assert (o.method, o.price, o.currency) == ("selectors", D("1299.99"), "RON")
+
+
+def test_selector_pointing_at_a_struck_price_still_reads_it() -> None:
+    html = '<div><del class="was">1.499,99 Lei</del> <b class="now">1.299,99 Lei</b></div>'
+    assert extract_offer(html, URL, SelectorConfig(price="del.was")).price == D("1499.99")
+    o = extract_offer(html, URL, SelectorConfig(price="b.now", original_price="del.was"))
+    assert (o.price, o.original_price) == (D("1299.99"), D("1499.99"))
+
+
+# --------------------------------------------------------------------------- configured currency
+
+
+@pytest.mark.parametrize(
+    ("html", "selectors", "configured", "expected"),
+    [
+        ('<main><h1>T</h1><div class="product-price">$449.99</div></main>', None, "CAD", "CAD"),
+        ('<main><h1>T</h1><div class="product-price">$449.99</div></main>', None, None, "USD"),
+        ('<main><h1>T</h1><div class="product-price">$449.99</div></main>', None, "EUR", "USD"),
+        ('<main><h1>T</h1><div class="product-price">17 499 lei</div></main>', None, "MDL", "MDL"),
+        ('<main><h1>T</h1><div class="product-price">17 499 lei</div></main>',
+         SelectorConfig(price=".product-price"), "MDL", "MDL"),
+        ('<main><h1>T</h1><div class="product-price">1.299 kr</div></main>', None, "SEK", "SEK"),
+        (page(product(offers={"price": "449.99", "priceCurrency": "$"})), None, "AUD", "AUD"),
+        # An ISO code is never second-guessed: a CAD shop may well serve USD prices.
+        (page(product(offers={"price": "449.99", "priceCurrency": "USD"})), None, "CAD", "USD"),
+        (page(product(offers={"price": "449.99", "priceCurrency": "RON"})), None, "MDL", "RON"),
+    ],
+)  # fmt: skip
+def test_configured_currency_decides_shared_markers(
+    html: str, selectors: SelectorConfig | None, configured: str | None, expected: str
+) -> None:
+    assert extract_offer(html, URL, selectors, configured).currency == expected
+
+
+# --------------------------------------------------------------------------- dot thousands in meta prices
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "expected"),
+    [
+        ("12.990", "HUF", "12990"),
+        ("129.990", "HUF", "129990"),
+        ("1.299", "RON", "1299"),
+        ("1.299", "KWD", "1.299"),  # three-decimal currency
+        ("12.99", "HUF", "12.99"),
+        ("0.990", "EUR", "0.990"),
+    ],
+)
+def test_og_price_with_dot_thousands(amount: str, currency: str, expected: str) -> None:
+    head = (
+        f'<meta property="og:price:amount" content="{amount}">'
+        f'<meta property="og:price:currency" content="{currency}">'
+    )
+    o = extract_offer(page(head=head), URL)
+    assert (o.method, o.price, o.currency) == ("opengraph", D(expected), currency)
+
+
+def test_jsonld_price_with_dot_thousands() -> None:
+    o = extract_offer(page(product(offers={"price": "1.299", "priceCurrency": "RON"})), URL)
+    assert o.price == D("1299")
+
+
+# --------------------------------------------------------------------------- back-in-stock sign-ups
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Notify me when available",
+        "Anunță-mă când este disponibil",
+        "Avertizează-mă când revine în stoc",
+        "Email me when back in stock",
+        "E-mail me when available",
+        "Benachrichtigen, wenn verfügbar",
+        "Prévenez-moi lorsque disponible",
+        "Avísame cuando esté disponible",
+        "Powiadom o dostępności",
+        "Back in stock soon",
+        "In stock soon",
+        "Out-of-stock",
+    ],
+)
+def test_back_in_stock_sign_ups_are_out_of_stock(text: str) -> None:
+    assert availability_from_text(text) is A.OUT_OF_STOCK
+
+
+@pytest.mark.parametrize(
+    ("stock", "expected"),
+    [
+        ('<div class="product-stock out-of-stock"><button>Anunță-mă când este disponibil</button></div>',
+         A.OUT_OF_STOCK),
+        ('<p class="stock outOfStock"></p>', A.OUT_OF_STOCK),
+        ('<div class="stock available"><span>Livrare în 24h</span></div>', A.IN_STOCK),
+        ('<div class="product-stock">În stoc</div>', A.IN_STOCK),
+    ],
+)  # fmt: skip
+def test_page_stock_state_class_then_label(stock: str, expected: Availability) -> None:
+    html = f'<main><h1>X</h1><div class="product-price">1.299,99 Lei</div>{stock}</main>'
+    assert extract_offer(html, URL).availability is expected

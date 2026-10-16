@@ -129,7 +129,7 @@ of the file. Relative `database` and `file` notifier paths are resolved next to 
 | `product_url_pattern` | Regex a URL must match to count as a product page during discovery. |
 | `selectors` | CSS selectors for sites without (or with wrong) structured data. See the next section. |
 | `render_js` | Render pages with headless Chromium (needs the `[js]` extra). |
-| `currency` | Currency to assume when the page shows none. |
+| `currency` | Currency to assume when the page shows none, and what a symbol several currencies share means on this site (`$` in a CAD shop, `lei` in a Moldovan one). ISO codes on the page always win. |
 | `requests_per_minute` | Per-host pace (default 30). A robots.txt Crawl-delay can only lower it. |
 | `headers` | Extra request headers, e.g. `Accept-Language`. |
 | `enabled` | `false` skips the competitor without deleting it. |
@@ -221,6 +221,13 @@ Pinned `competitor_urls` replace discovery for that pair.
 The first layer that has a price decides the price, currency and method. Identity fields come
 from whichever layer has them. Each page is fetched at most once per run, even when search
 results, candidates and listings point to it.
+
+On a page offering several variants, the price is the one of the variant that is your product
+(by GTIN or MPN, then by name, e.g. "256GB Black"), and new offers win over used or refurbished
+ones. Two kinds of page give no price instead of a guess, and discovery skips them: category and
+search pages (method `listing`), and pages whose variants differ in price while none of them is
+recognisably yours (method `ambiguous`; pin that variant's own URL instead). Instalment, shipping,
+savings, member-only and ex-VAT amounts shown around the price are ignored.
 
 **3. Matching.**
 

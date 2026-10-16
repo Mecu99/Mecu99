@@ -21,6 +21,19 @@ _ISO_CODES = frozenset(CURRENCY_ALIASES.values()) | frozenset(
 
 # Markers money.CURRENCY_ALIASES lacks; there a bare "$" means USD, so "R$" must not.
 _EXTRA_ALIASES = {"r$": "BRL", "mx$": "MXN", "nz$": "NZD", "hk$": "HKD", "s$": "SGD"}
+# Markers several currencies share. A preferred currency (the competitor's configured one)
+# among a marker's candidates beats the alias default ("$" -> USD, "lei" -> RON); "kr" has none.
+_SHARED_MARKERS: dict[str, frozenset[str]] = {
+    "$": frozenset("USD CAD AUD NZD MXN SGD HKD ARS CLP COP TWD".split()),
+    "lei": frozenset({"RON", "MDL"}),
+    "leu": frozenset({"RON", "MDL"}),
+    "¥": frozenset({"JPY", "CNY"}),
+    "kr": frozenset({"SEK", "NOK", "DKK", "ISK"}),
+}
+# ISO 4217 currencies with three minor units. For any other currency a machine-readable
+# "12.990" cannot be 12.99 written with three decimals: it is 12990 (Shopify's money formats).
+_THREE_DECIMALS = frozenset({"BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"})
+_DOT_THOUSANDS_RE = re.compile(r"[1-9][0-9]{0,2}\.[0-9]{3}")
 # Local names that double as units or abbreviations ("5 ft", "Fr." = from): used only as a last resort.
 _AMBIGUOUS_WORDS = frozenset({"ft", "tl", "fr."})
 # Strength of a currency marker. Symbols and capitalised ISO codes count anywhere in
@@ -64,14 +77,23 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text.translate(_TRANSLATE)).strip()
 
 
-def _currency_tokens(s: str) -> list[_CcyToken]:
+def _marker_code(tok: str, preferred: str | None) -> str | None:
+    low = tok.lower()
+    shared = _SHARED_MARKERS.get(low) or _SHARED_MARKERS.get(low.rstrip("."), frozenset())
+    if preferred in shared:
+        return preferred
+    code = _EXTRA_ALIASES.get(low) or CURRENCY_ALIASES.get(low) or CURRENCY_ALIASES.get(low.rstrip("."))
+    if code is None and tok.isupper() and tok in _ISO_CODES:
+        code = tok
+    return code
+
+
+def _currency_tokens(s: str, preferred: str | None = None) -> list[_CcyToken]:
     tokens: list[_CcyToken] = []
     for m in _CCY_TOKEN_RE.finditer(s):
         tok = m.group()
         low = tok.lower()
-        code = _EXTRA_ALIASES.get(low) or CURRENCY_ALIASES.get(low) or CURRENCY_ALIASES.get(low.rstrip("."))
-        if code is None and tok.isupper() and tok in _ISO_CODES:
-            code = tok
+        code = _marker_code(tok, preferred)
         if not code:
             continue
         if not tok[0].isalpha() or tok.endswith("$") or (len(tok) == 3 and tok.isupper()):
@@ -130,24 +152,33 @@ def _number(token: str, *, dot_decimal: bool = False) -> Decimal | None:
     return Decimal(f"{whole}.{frac}" if frac else whole)
 
 
-def detect_currency(text: str | None) -> str | None:
-    """ISO code of the first, strongest currency marker in ``text`` (symbols and ISO codes first)."""
+def detect_currency(text: str | None, preferred: str | None = None) -> str | None:
+    """ISO code of the first, strongest currency marker in ``text`` (symbols and ISO codes first).
+
+    A marker several currencies share ("$", "lei", "kr") means ``preferred`` when it is one of them.
+    """
     if not text:
         return None
-    best = max(_currency_tokens(_clean(text)), key=lambda t: t.rank, default=None)
+    best = max(_currency_tokens(_clean(text), _iso(preferred)), key=lambda t: t.rank, default=None)
     return best.code if best else None
 
 
-def currency_code(raw: str | None) -> str | None:
+def currency_code(raw: str | None, preferred: str | None = None) -> str | None:
     """ISO code for a currency *field* such as ``"RON"``, ``"Lei"``, ``"€"`` or ``"us$"``.
 
     Markers recognised by :func:`detect_currency` (including letter-prefixed dollars such
     as ``"R$"``) come first; unknown but well-formed ISO codes still pass through.
     """
-    return detect_currency(raw) or normalize_currency(raw)
+    return detect_currency(raw, preferred) or normalize_currency(raw)
 
 
-def parse_price(text: str | None, default_currency: str | None = None) -> tuple[Decimal | None, str | None]:
+def _iso(preferred: str | None) -> str | None:
+    return currency_code(preferred) if preferred else None
+
+
+def parse_price(
+    text: str | None, default_currency: str | None = None, preferred: str | None = None
+) -> tuple[Decimal | None, str | None]:
     """Parse a displayed price such as ``"1.234,56 €"`` or ``"From $10"``.
 
     Returns ``(amount, currency)``. The amount is the first price in the text,
@@ -156,13 +187,15 @@ def parse_price(text: str | None, default_currency: str | None = None) -> tuple[
     ignored; negative amounts and text without a number give ``(None, None)``;
     "Free"-style labels give ``Decimal(0)``. The currency is the marker next to
     the chosen number, else any unambiguous marker, else ``default_currency``.
+    ``preferred`` (else ``default_currency``) decides what a marker several
+    currencies share means: "$" with ``"CAD"`` is CAD, "lei" with ``"MDL"`` MDL.
     Local names that double as units ("5 ft") only count when no other marker
     sits next to a number.
     """
     if not text:
         return None, None
     s = _clean(text)
-    tokens = _currency_tokens(s)
+    tokens = _currency_tokens(s, _iso(preferred or default_currency))
     fallback = next((t.code for t in tokens if t.rank == _SYMBOL), None) or currency_code(default_currency)
     nums = [
         (m, value)
@@ -192,12 +225,14 @@ def parse_price(text: str | None, default_currency: str | None = None) -> tuple[
     return amount, currency
 
 
-def parse_decimal(value: object) -> Decimal | None:
+def parse_decimal(value: object, currency: str | None = None) -> Decimal | None:
     """Parse a machine-readable price (JSON-LD ``price``, ``content`` attributes).
 
     Accepts int/float/Decimal/str. In strings '.' is the decimal separator, but
     "1,299.00" and "1299,00" are tolerated; strings with extra text fall back to
-    :func:`parse_price`. Returns ``None`` for negative, non-finite or garbage values.
+    :func:`parse_price`. When ``currency`` is known and has fewer than three minor
+    units, "12.990" is 12990 (no such currency has a third decimal to write).
+    Returns ``None`` for negative, non-finite or garbage values.
     """
     if value is None or isinstance(value, bool):
         return None
@@ -207,7 +242,10 @@ def parse_decimal(value: object) -> Decimal | None:
         number = Decimal(str(value))
     elif isinstance(value, str):
         s = _clean(value)
-        if _PLAIN_NUMBER_RE.fullmatch(s):
+        code = _iso(currency)
+        if code and code not in _THREE_DECIMALS and _DOT_THOUSANDS_RE.fullmatch(s):
+            number = Decimal(s.replace(".", ""))
+        elif _PLAIN_NUMBER_RE.fullmatch(s):
             number = Decimal(s)
         elif _NUM_RE.fullmatch(s):
             number = _number(s, dot_decimal=True)
