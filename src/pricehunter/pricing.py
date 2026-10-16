@@ -19,6 +19,14 @@ _ISO_CODES = frozenset(CURRENCY_ALIASES.values()) | frozenset(
     " KRW KZT MKD MXN MYR NZD PEN RSD RUB SAR SGD THB VND ZAR".split()
 )
 
+# Markers money.CURRENCY_ALIASES lacks; there a bare "$" means USD, so "R$" must not.
+_EXTRA_ALIASES = {"r$": "BRL", "mx$": "MXN", "nz$": "NZD", "hk$": "HKD", "s$": "SGD"}
+# Local names that double as units or abbreviations ("5 ft", "Fr." = from): used only as a last resort.
+_AMBIGUOUS_WORDS = frozenset({"ft", "tl", "fr."})
+# Strength of a currency marker. Symbols and capitalised ISO codes count anywhere in
+# the text; local names only next to a number, and ambiguous ones only if nothing else is.
+_SYMBOL, _WORD, _AMBIGUOUS = 2, 1, 0
+
 # Zero-width / soft-hyphen characters vanish; typographic apostrophes become "'".
 _TRANSLATE = {
     **dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None),
@@ -34,8 +42,10 @@ _NUM_RE = re.compile(
     r"|[.,][0-9]+"
     r")"
 )
-# Currency markers: "$"-prefixed variants, symbols, or any word (checked against the alias table).
-_CCY_TOKEN_RE = re.compile(r"(?<![^\W\d_])(?:US|CA|AU|C|A)\$|\$|[€£¥₹₺₴]|[^\W\d_]+\.?", re.IGNORECASE)
+# Currency markers: letter-prefixed "$" ("US$", "R$"), symbols, or any word (looked up in the alias tables).
+_CCY_TOKEN_RE = re.compile(r"(?<![^\W\d_])[a-z]{1,2}\$|\$|[€£¥₹₺₴]|[^\W\d_]+\.?", re.IGNORECASE)
+# A number Python's Decimal reads as-is: "1299", "19.99", ".5", "1e3".
+_PLAIN_NUMBER_RE = re.compile(r"[0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?", re.IGNORECASE)
 _RANGE_GAP_RE = re.compile(r"\s*(?:-|\u2013|\u2014|~|to|bis|la|à)\s*", re.IGNORECASE)
 # A minus sign attached to the number, optionally with a symbol in between ("-5", "€-5", "-€ 5").
 _NEGATIVE_RE = re.compile(r"(?<!\w)[-\u2212](?:[^\w\s]{1,3} ?)?$")
@@ -47,7 +57,7 @@ class _CcyToken:
     start: int
     end: int
     code: str
-    strong: bool  # symbols and capitalised ISO codes count anywhere; words only next to a number
+    rank: int  # _SYMBOL, _WORD or _AMBIGUOUS
 
 
 def _clean(text: str) -> str:
@@ -59,13 +69,16 @@ def _currency_tokens(s: str) -> list[_CcyToken]:
     for m in _CCY_TOKEN_RE.finditer(s):
         tok = m.group()
         low = tok.lower()
-        is_word = tok[0].isalpha() and not tok.endswith("$")
-        code = CURRENCY_ALIASES.get(low) or CURRENCY_ALIASES.get(low.rstrip("."))
+        code = _EXTRA_ALIASES.get(low) or CURRENCY_ALIASES.get(low) or CURRENCY_ALIASES.get(low.rstrip("."))
         if code is None and tok.isupper() and tok in _ISO_CODES:
             code = tok
-        if code:
-            strong = not is_word or (len(tok) == 3 and tok.isupper())
-            tokens.append(_CcyToken(m.start(), m.end(), code, strong))
+        if not code:
+            continue
+        if not tok[0].isalpha() or tok.endswith("$") or (len(tok) == 3 and tok.isupper()):
+            rank = _SYMBOL
+        else:
+            rank = _AMBIGUOUS if low in _AMBIGUOUS_WORDS else _WORD
+        tokens.append(_CcyToken(m.start(), m.end(), code, rank))
     return tokens
 
 
@@ -118,19 +131,18 @@ def _number(token: str, *, dot_decimal: bool = False) -> Decimal | None:
 
 
 def detect_currency(text: str | None) -> str | None:
-    """ISO code of the first currency marker in ``text`` (symbols and ISO codes first)."""
+    """ISO code of the first, strongest currency marker in ``text`` (symbols and ISO codes first)."""
     if not text:
         return None
-    tokens = _currency_tokens(_clean(text))
-    best = next((t for t in tokens if t.strong), tokens[0] if tokens else None)
+    best = max(_currency_tokens(_clean(text)), key=lambda t: t.rank, default=None)
     return best.code if best else None
 
 
 def currency_code(raw: str | None) -> str | None:
     """ISO code for a currency *field* such as ``"RON"``, ``"Lei"``, ``"€"`` or ``"us$"``.
 
-    Known local names win over money.normalize_currency's "any three letters"
-    rule, so ``"Lei"`` is RON rather than ``"LEI"``; unknown ISO codes still pass.
+    Markers recognised by :func:`detect_currency` (including letter-prefixed dollars such
+    as ``"R$"``) come first; unknown but well-formed ISO codes still pass through.
     """
     return detect_currency(raw) or normalize_currency(raw)
 
@@ -144,12 +156,14 @@ def parse_price(text: str | None, default_currency: str | None = None) -> tuple[
     ignored; negative amounts and text without a number give ``(None, None)``;
     "Free"-style labels give ``Decimal(0)``. The currency is the marker next to
     the chosen number, else any unambiguous marker, else ``default_currency``.
+    Local names that double as units ("5 ft") only count when no other marker
+    sits next to a number.
     """
     if not text:
         return None, None
     s = _clean(text)
     tokens = _currency_tokens(s)
-    fallback = next((t.code for t in tokens if t.strong), None) or currency_code(default_currency)
+    fallback = next((t.code for t in tokens if t.rank == _SYMBOL), None) or currency_code(default_currency)
     nums = [
         (m, value)
         for m in _NUM_RE.finditer(s)
@@ -158,22 +172,24 @@ def parse_price(text: str | None, default_currency: str | None = None) -> tuple[
     if not nums:
         return (Decimal(0), fallback) if _FREE_RE.search(s) else (None, None)
 
-    def currency_next_to(m: re.Match[str]) -> str | None:
-        return next((t.code for t in tokens if _adjacent(s, m, t)), None)
+    def currency_next_to(m: re.Match[str], min_rank: int) -> str | None:
+        return next((t.code for t in tokens if t.rank >= min_rank and _adjacent(s, m, t)), None)
 
-    chosen, amount, currency = nums[0][0], nums[0][1], None
-    for i, (m, value) in enumerate(nums):
-        currency = currency_next_to(m)
-        if currency is None and i + 1 < len(nums):
-            nxt = nums[i + 1][0]
-            if _RANGE_GAP_RE.fullmatch(s[m.end() : nxt.start()]):
-                currency = currency_next_to(nxt)
-        if currency:
-            chosen, amount = m, value
-            break
+    def pick(min_rank: int) -> tuple[re.Match[str], Decimal, str] | None:
+        for i, (m, value) in enumerate(nums):
+            currency = currency_next_to(m, min_rank)
+            if currency is None and i + 1 < len(nums):
+                nxt = nums[i + 1][0]
+                if _RANGE_GAP_RE.fullmatch(s[m.end() : nxt.start()]):
+                    currency = currency_next_to(nxt, min_rank)
+            if currency:
+                return m, value, currency
+        return None
+
+    chosen, amount, currency = pick(_WORD) or pick(_AMBIGUOUS) or (*nums[0], fallback)
     if _NEGATIVE_RE.search(s[: chosen.start()]):
         return None, None
-    return amount, currency or fallback
+    return amount, currency
 
 
 def parse_decimal(value: object) -> Decimal | None:
@@ -191,9 +207,17 @@ def parse_decimal(value: object) -> Decimal | None:
         number = Decimal(str(value))
     elif isinstance(value, str):
         s = _clean(value)
-        number = _number(s, dot_decimal=True) if _NUM_RE.fullmatch(s) else parse_price(s)[0]
+        if _PLAIN_NUMBER_RE.fullmatch(s):
+            number = Decimal(s)
+        elif _NUM_RE.fullmatch(s):
+            number = _number(s, dot_decimal=True)
+        else:
+            number = parse_price(s)[0]
     else:
         return None
     if number is None or not number.is_finite() or number < 0:
         return None
+    exponent = number.as_tuple().exponent
+    if isinstance(exponent, int) and exponent > 0:
+        number = Decimal(f"{number:f}")  # "1E+3" -> "1000"
     return number

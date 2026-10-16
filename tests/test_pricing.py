@@ -38,6 +38,12 @@ def _check(text: str | None, amount: str | None, currency: str | None, default: 
         ("US$5", "5", "USD"),
         ("C$ 12.50", "12.50", "CAD"),
         ("A$ 99", "99", "AUD"),
+        ("R$ 99,90", "99.90", "BRL"),  # not USD although money.py maps a bare "$" to USD
+        ("MX$ 1,299", "1299", "MXN"),
+        ("NZ$5", "5", "NZD"),
+        ("HK$ 12.50", "12.50", "HKD"),
+        ("S$9", "9", "SGD"),
+        ("Z$ 5", "5", None),  # unknown dollar prefix: no guess
         ("€ 0,99", "0.99", "EUR"),
         ("£1,000", "1000", "GBP"),
         ("¥1,000", "1000", "JPY"),
@@ -85,6 +91,12 @@ def _check(text: str | None, amount: str | None, currency: str | None, default: 
         ("2 x 19,99 lei", "19.99", "RON"),
         ("Model 2024 - €19.99", "19.99", "EUR"),
         ("Model X - 5 €", "5", "EUR"),
+        ("19,99 lei (4 €)", "19.99", "RON"),
+        # ambiguous local names ("ft" = feet, "tl", "Fr." = from) lose to any other marker
+        ("Cable 5 ft $9.99", "9.99", "USD"),
+        ("Hose 10 ft - 24,99 lei", "24.99", "RON"),
+        ("99 TL", "99", "TRY"),
+        ("1 990 Ft", "1990", "HUF"),
         # percentages and dates are never prices
         ("-20% 79,99 lei", "79.99", "RON"),
         ("Save 15%: 85,00 €", "85.00", "EUR"),
@@ -205,6 +217,9 @@ def test_parse_price_never_raises(text: str) -> None:
         ("Euro (EUR)", "EUR"),
         ("Preț în lei", "RON"),
         ("NZD", "NZD"),
+        ("R$", "BRL"),
+        ("5 ft, $", "USD"),
+        ("Ft", "HUF"),
         ("electronics", None),
         ("SKU", None),
         ("", None),
@@ -220,7 +235,7 @@ def test_detect_currency(text: str | None, expected: str | None) -> None:
     [
         ("RON", "RON"),
         ("ron", "RON"),
-        ("Lei", "RON"),  # money.normalize_currency would give "LEI"
+        ("Lei", "RON"),
         ("€", "EUR"),
         ("eur", "EUR"),
         ("XAF", "XAF"),  # unknown but well-formed ISO code passes through
@@ -256,6 +271,9 @@ def test_currency_code(raw: str | None, expected: str | None) -> None:
         ("€19.99", "19.99"),
         ("19.99 EUR", "19.99"),
         ("1.299,99 lei", "1299.99"),
+        ("1e3", "1000"),
+        ("2.5E1", "25"),
+        ("1E-2", "0.01"),
     ],
 )
 def test_parse_decimal(value: object, expected: str) -> None:
@@ -292,3 +310,11 @@ def test_parse_decimal_rejects(value: object) -> None:
 def test_parse_decimal_float_has_no_binary_noise() -> None:
     assert str(parse_decimal(0.1)) == "0.1"
     assert str(parse_decimal(1299.99)) == "1299.99"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1e20, "100000000000000000000"), ("1e30", "1" + "0" * 30), (10**30, "1" + "0" * 30)],
+)
+def test_parse_decimal_huge_values_are_plain_digits(value: object, expected: str) -> None:
+    assert str(parse_decimal(value)) == expected

@@ -74,7 +74,7 @@ _UNIT_ALIASES: dict[str, str] = {
     "mm": "mm", "cm": "cm", "m": "m",
     "mp": "mp", "mpx": "mp",
     "pcs": "pcs", "pc": "pcs", "buc": "pcs", "bucati": "pcs", "piece": "pcs", "pieces": "pcs",
-    "pack": "pcs", "pk": "pcs",
+    "pack": "pcs", "pk": "pcs", "%": "pct",
 }  # fmt: skip
 _CANONICAL_UNITS = frozenset(_UNIT_ALIASES.values()) | {"x"}
 
@@ -85,6 +85,7 @@ def _alternation(words: Iterable[str]) -> str:
 
 _NUM = r"(?<![\w.,])(\d+(?:[.,]\d+)?)"
 _END = r"(?![a-z0-9])"
+_COMMA_NUM = re.compile(r"(?<![\w.,])\d+,\d+(?![\w,])")
 _PLUS = re.compile(r"(?<=[a-z0-9])\+(?![a-z0-9])")
 _N_IN_1 = re.compile(r"(?<!\w)(\d)\s*-?\s*in\s*-?\s*1(?!\d)")
 _MULT_PREFIX = re.compile(r"(?<![\w.,])(\d+)\s*[x×*]\s*(?=\d)")
@@ -160,6 +161,7 @@ def normalize_text(text: str) -> str:
     s = _INCH_MARK.sub(lambda m: _canon_number(m[1]) + "in ", s)
     s = _UNIT.sub(_unit_repl, s)
     s = _MULT_SUFFIX.sub(r"\1 \2x", s)
+    s = _COMMA_NUM.sub(lambda m: _canon_number(m[0]), s)
     s = _CODE.sub(_code_repl, s)
     s = _LOOSE_DOT.sub(" ", _PUNCT.sub(" ", s))
     return " ".join(_COLOURS.get(w, w) for w in s.split())
@@ -207,15 +209,27 @@ def _spec_conflicts(a: str, b: str) -> list[str]:
     """Unit families where neither side's values contain the other's (128gb vs 256gb).
 
     A subset is fine: titles often add RAM ("8GB RAM, 256GB") that the other side leaves out.
+    A pack count on one side only conflicts when both sides state the same unit size
+    ("6 x 0.5 L" vs "0.5 L" is a multipack versus a single bottle).
     """
     sa, sb = _canonical_specs(a), _canonical_specs(b)
-    return sorted(u for u in sa.keys() & sb.keys() if not (sa[u] <= sb[u] or sb[u] <= sa[u]))
+    conflicts = {u for u in sa.keys() & sb.keys() if not (sa[u] <= sb[u] or sb[u] <= sa[u])}
+    pa, pb = sa.get("pcs", set()), sb.get("pcs", set())
+    one_sided_pack = set() if pa and pb else pa | pb
+    same_size = any(sa.get(f, set()) & sb.get(f, set()) for f in ("ml", "g"))
+    if same_size and any(n > 1 for n in one_sided_pack):
+        conflicts.add("pcs")
+    return sorted(conflicts)
 
 
 # --------------------------------------------------------------------------- model numbers
 
 _CHUNK = re.compile(r"[a-z0-9]+(?:[-/_][a-z0-9]+)*")
-_UNIT_LIKE = re.compile(r"\d+(?:\.\d+)?(?:" + _alternation(set(_UNIT_ALIASES) | {"x", "k", "p"}) + r")")
+_UNITS_RE = _alternation(set(_UNIT_ALIASES) | {"x"})
+# Quantities, not model numbers: "128gb", "6x2l", "1920x1080", "4k", "1080p".
+_UNIT_LIKE = re.compile(
+    rf"(?:\d+(?:\.\d+)?x)?\d+(?:\.\d+)?(?:{_UNITS_RE})?|[1-9]\d?k|\d{{3,4}}[pi]"
+)
 # Standards and ratings that look like model numbers but say nothing about which model it is.
 _GENERIC_MODEL = re.compile(
     r"(?:wi-?fi|wlan|usb|ddr|lpddr|gddr|pcie|hdmi|bt|ip|ipx|hdr|dvb[tsc]|h|gen|cat|rev|ver"
@@ -271,12 +285,19 @@ def _shape(token: str) -> str:
     return re.sub(r"\d+(?:\.\d+)?", "#", token)
 
 
+def _respelled(token: str, other_compact: str) -> bool:
+    """A dotted code the other side writes without dots ("ecam22.110" vs a slug's "ecam22 110")."""
+    plain = token.replace(".", "")
+    return "." in token and len(plain) >= 5 and plain in other_compact
+
+
 def _number_conflict(a: str, b: str) -> bool:
     """Same-shaped numeric tokens that differ: "iphone 15" vs "iphone 14", "s24" vs "s23"."""
     na = {t for t in a.split() if any(c.isdigit() for c in t)}
     nb = {t for t in b.split() if any(c.isdigit() for c in t)}
-    only_b = {_shape(t) for t in nb - na}
-    return any(_shape(t) in only_b for t in na - nb)
+    ca, cb = re.sub(r"[\s.]", "", a), re.sub(r"[\s.]", "", b)
+    only_b = {_shape(t) for t in nb - na if not _respelled(t, ca)}
+    return any(_shape(t) in only_b for t in na - nb if not _respelled(t, cb))
 
 
 # --------------------------------------------------------------------------- guards
@@ -297,8 +318,11 @@ _FOR = re.compile(r"\b(?:for|pentru)\s+(\w+)")
 
 
 def _accessory_terms(text: str, anchors: frozenset[str]) -> set[str]:
+    """Accessory/condition keywords, plus ``"for"`` when the text is *for* something: it says
+    "for <one of our product's words>" or names an accessory (a case is always for a phone)."""
     terms = set(_ACCESSORY.findall(text))
-    terms.update(f"for {w}" for w in _FOR.findall(text) if w in anchors)
+    if terms or any(w in anchors for w in _FOR.findall(text)):
+        terms.add("for")
     return terms
 
 
@@ -394,7 +418,8 @@ def score_match(product: Product, offer: ExtractedOffer) -> MatchResult:
         return _result(0.05, "gtin_conflict", {"gtin": 0.0})
 
     p_raw, p_text = _compose(product.brand, product.name, product.mpn)
-    o_raw, o_text = _compose(offer.brand, offer.title, offer.mpn)
+    # Their MPN only adds noise to the title comparison when we have none to compare it with.
+    o_raw, o_text = _compose(offer.brand, offer.title, offer.mpn if product.mpn else None)
     spec_conflicts = _spec_conflicts(p_text, o_text)
 
     pm, om = _norm_mpn(product.mpn), _norm_mpn(offer.mpn)
@@ -407,7 +432,7 @@ def score_match(product: Product, offer: ExtractedOffer) -> MatchResult:
 
     details = title_similarity(p_text, o_text)
     score, reason = details["title"], "title"
-    pt, ot = _model_tokens(p_raw), _model_tokens(o_raw)
+    pt, ot = _model_tokens(p_raw), _model_tokens(f"{o_raw} {offer.mpn or ''}")
     model_clash = bool(pt and ot and not _tokens_overlap(pt, ot))
     if pt and ot and not model_clash:
         score = min(1.0, score + 0.1)

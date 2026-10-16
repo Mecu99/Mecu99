@@ -1,0 +1,182 @@
+# PriceHunter configuration
+# =========================
+# Docs: README.md. Validate any change with: pricehunter prices -c <this file>
+#
+# Values can come from the environment: ${VAR} or ${VAR:-default}
+# (handy for webhook URLs and other secrets you do not want in this file).
+
+settings:
+  # SQLite file holding listings, price history and alerts.
+  # A relative path is resolved next to this config file.
+  database: pricehunter.db
+  # Maximum number of requests in flight across all competitors.
+  concurrency: 8
+  # Identify your bot honestly and give site owners a way to reach you.
+  user_agent: "PriceHunter/0.1 (+https://example.com/pricehunter-contact)"
+  # Obey robots.txt (Disallow rules and Crawl-delay). Keep this on.
+  respect_robots: true
+  # Seconds before a single request gives up.
+  timeout: 20
+  # Retries for network errors, HTTP 429 and 5xx (exponential backoff; Retry-After is honoured).
+  max_retries: 3
+  # Optional HTTP(S) proxies, used in rotation, e.g. to see the prices of a given region.
+  proxies: []
+  #   - http://user:password@proxy.example.com:8080
+  # Minimum match score (0-1) for a discovered page to count as the same product.
+  match_threshold: 0.80
+  # How many candidate pages to check per product and competitor during discovery.
+  max_candidates_per_competitor: 8
+  # Currency the rates below are expressed in.
+  base_currency: EUR
+  # Units of base_currency for 1 unit of each other currency.
+  currency_rates:
+    RON: "0.201"
+    USD: "0.92"
+    GBP: "1.17"
+  # Look for new or better competitor pages for a product after this many hours.
+  rediscover_after_hours: 168
+  # Add the competitor's shipping cost (when the page shows one) before comparing prices.
+  include_shipping: false
+
+competitors:
+  # A shop with good structured data (JSON-LD / microdata / OpenGraph) needs no selectors.
+  - name: ExampleShop
+    base_url: https://www.example-shop.com
+    # Site search; {query} is replaced by the URL-encoded query (GTIN, brand + MPN, name...).
+    search_url: /search?q={query}
+    # Only URLs matching this regex are treated as product pages during discovery.
+    product_url_pattern: "/product/"
+    # Currency to assume when a page shows none.
+    currency: EUR
+    # Be polite: requests per minute to this host (robots.txt Crawl-delay can lower it).
+    requests_per_minute: 20
+    # Render pages in headless Chromium (needs: pip install "pricehunter[js]").
+    render_js: false
+    # Extra HTTP headers, e.g. a language preference.
+    headers: {}
+    # Set to false to skip this competitor without deleting it.
+    enabled: true
+
+  # A shop without structured data: tell PriceHunter where things are with CSS selectors.
+  # Use `pricehunter probe <product-url> --competitor MagazinExemplu` to try them.
+  - name: MagazinExemplu
+    base_url: https://www.magazin-exemplu.ro
+    # No usable site search: candidates come from the sitemap instead
+    # (without sitemap_url, robots.txt "Sitemap:" lines or /sitemap.xml are used).
+    sitemap_url: /sitemap_index.xml
+    product_url_pattern: "/p/"
+    currency: RON
+    requests_per_minute: 12
+    render_js: false
+    headers:
+      Accept-Language: "ro-RO,ro;q=0.9"
+    enabled: true
+    selectors:
+      price: ".product-page .price-new"
+      # Read the price from an attribute instead of the text, e.g. data-price or content.
+      price_attr: null
+      original_price: ".product-page .price-old"
+      title: "h1.page-title"
+      currency: null
+      availability: ".stock-status"
+      gtin: ".specs .ean"
+      mpn: ".specs .part-number"
+      brand: ".specs .brand"
+      shipping: ".delivery-cost"
+      # Links to product pages on a search/listing page (discovery).
+      search_result_link: ".product-list a.product-title"
+
+products:
+  - sku: HP-SONY-XM5
+    name: Sony WH-1000XM5 Wireless Noise Cancelling Headphones
+    brand: Sony
+    # Identifiers make matching exact: a GTIN (EAN/UPC) beats everything, then the MPN.
+    gtin: "4548736132610"
+    mpn: WH1000XM5B
+    our_price: "349.00"
+    cost: "255.00"
+    currency: EUR
+    # Extra search queries for discovery.
+    keywords:
+      - WH-1000XM5 black
+    # Repricing bounds for this product (the margin floor below also applies).
+    min_price: "299.00"
+    max_price: "399.00"
+    # Known competitor pages (keyed by competitor name). They skip discovery and matching.
+    competitor_urls: {}
+
+  - sku: PH-IPHONE15-128
+    name: Apple iPhone 15 128GB Black
+    brand: Apple
+    gtin: "0195949035500"
+    mpn: MTP03
+    our_price: "899.00"
+    cost: "745.00"
+    currency: EUR
+    keywords: []
+    min_price: null
+    max_price: null
+    competitor_urls:
+      MagazinExemplu:
+        - https://www.magazin-exemplu.ro/p/telefon-apple-iphone-15-128gb-black-12345
+
+repricing:
+  # beat_lowest | match_lowest | median | hold
+  strategy: beat_lowest
+  # beat_lowest undercuts the cheapest competitor by this amount...
+  undercut_amount: "0.01"
+  # ...or by this percentage when set (takes precedence; 0 means match the lowest).
+  undercut_percent: null
+  # Never suggest less than cost * (1 + min_margin_percent / 100).
+  min_margin_percent: "10"
+  # Ignore competitors that are out of stock.
+  ignore_out_of_stock: true
+  # Only competitor offers matched at least this well are used for repricing.
+  min_match_score: 0.85
+  # Make suggested prices end in this fraction, e.g. 0.99 (null keeps cents as computed).
+  price_ending: "0.99"
+
+alerts:
+  # undercut: a competitor sells at least threshold_percent below our_price.
+  - type: undercut
+    threshold_percent: 2
+  # price_drop / price_rise: a competitor changed its price by at least threshold_percent.
+  - type: price_drop
+    threshold_percent: 5
+  - type: price_rise
+    threshold_percent: 5
+  # out_of_stock / back_in_stock: a competitor listing changed availability.
+  - type: out_of_stock
+  - type: back_in_stock
+  # new_lowest: the cheapest price on the market went down.
+  - type: new_lowest
+    threshold_percent: 0
+    # Limit any rule to some competitors and/or SKUs (null = all).
+    competitors: null
+    skus: null
+
+notifiers:
+  # Print alerts in the terminal.
+  - type: console
+  # Append alerts as JSON lines (a relative path is resolved next to this config file).
+  - type: file
+    path: alerts.jsonl
+  # Generic webhook: POST {"alerts": [...]}.
+  # - type: webhook
+  #   url: https://hooks.example.com/pricehunter
+  # Slack / Discord incoming webhooks.
+  # - type: slack
+  #   url: ${SLACK_WEBHOOK_URL}
+  # - type: discord
+  #   url: ${DISCORD_WEBHOOK_URL}
+  # E-mail over SMTP (STARTTLS; port 465 uses implicit TLS). The password is read from
+  # the environment variable named by smtp_password_env.
+  # - type: email
+  #   smtp_host: smtp.example.com
+  #   smtp_port: 587
+  #   smtp_user: alerts@example.com
+  #   smtp_password_env: PRICEHUNTER_SMTP_PASSWORD
+  #   smtp_starttls: true
+  #   email_from: alerts@example.com
+  #   email_to:
+  #     - pricing-team@example.com

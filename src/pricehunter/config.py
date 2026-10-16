@@ -28,8 +28,12 @@ def load_config(path: str | Path) -> AppConfig:
     text = _expand_env(p.read_text(encoding="utf-8"))
     data = json.loads(text) if p.suffix.lower() == ".json" else yaml.safe_load(text)
     cfg = AppConfig.model_validate(data or {})
-    # Relative database paths resolve next to the config file, not the CWD.
+    # Relative database and alert-file paths resolve next to the config file, not the CWD,
+    # so scheduled runs (cron, systemd) behave the same from any working directory.
     db = Path(cfg.settings.database)
     if not db.is_absolute():
         cfg.settings.database = str((p.parent / db).resolve())
+    for notifier in cfg.notifiers:
+        if notifier.type == "file" and notifier.path and not Path(notifier.path).is_absolute():
+            notifier.path = str((p.parent / notifier.path).resolve())
     return cfg

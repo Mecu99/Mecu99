@@ -438,6 +438,54 @@ def test_jsonld_offers_by_id_reference() -> None:
     assert (o.price, o.currency, o.availability, o.title) == (D("42.00"), "PLN", A.IN_STOCK, "Ref")
 
 
+def test_jsonld_offer_linked_back_through_item_offered() -> None:
+    graph = {
+        "@context": "https://schema.org",
+        "@graph": [
+            {"@type": "Product", "@id": "#p", "name": "Reverse", "gtin13": "4006381333931"},
+            {"@type": "Offer", "price": "7.00", "priceCurrency": "EUR", "itemOffered": {"@id": "#p"}},
+        ],
+    }
+    o = extract_offer(page(graph), URL)
+    assert (o.method, o.price, o.currency, o.title, o.gtin) == (
+        "jsonld",
+        D("7.00"),
+        "EUR",
+        "Reverse",
+        "4006381333931",
+    )
+
+
+def test_jsonld_bare_offer_without_product() -> None:
+    offer = {
+        "@context": "https://schema.org",
+        "@type": "Offer",
+        "price": "12.50",
+        "priceCurrency": "EUR",
+        "availability": "https://schema.org/InStock",
+        "itemOffered": {"@type": "Thing", "name": "Desk Lamp", "sku": "DL-1"},
+    }
+    o = extract_offer(page(offer), URL)
+    assert (o.method, o.price, o.currency, o.availability) == ("jsonld", D("12.50"), "EUR", A.IN_STOCK)
+    assert (o.title, o.sku) == ("Desk Lamp", "DL-1")
+
+
+def test_jsonld_currency_written_inside_price() -> None:
+    o = extract_offer(page(product(offers={"@type": "Offer", "price": "1.299,99 lei"})), URL)
+    assert (o.price, o.currency) == (D("1299.99"), "RON")
+
+
+def test_jsonld_unescaped_quote_in_product_name() -> None:
+    raw = (
+        '{"@context": "https://schema.org", "@type": "Product", "name": "Smart TV 55" 4K UHD", "sku": "TV55",'
+        ' "offers": {"@type": "Offer", "price": "2999.00", "priceCurrency": "RON",'
+        ' "availability": "https://schema.org/InStock"}}'
+    )
+    o = extract_offer(page(raw), URL)
+    assert (o.method, o.price, o.currency, o.availability) == ("jsonld", D("2999.00"), "RON", A.IN_STOCK)
+    assert (o.title, o.sku) == ('Smart TV 55" 4K UHD', "TV55")
+
+
 def test_jsonld_prefers_product_whose_url_matches_page() -> None:
     related = product(
         name="Related", url="https://shop.example/p/other", offers={"price": 5, "priceCurrency": "EUR"}
@@ -548,6 +596,21 @@ def test_og_price_amount() -> None:
     assert (o.method, o.price, o.currency) == ("opengraph", D("15"), "USD")
 
 
+def test_microdata_bare_offer_with_item_offered() -> None:
+    html = """
+    <h1>Lamp page</h1>
+    <div itemscope itemtype="http://schema.org/Offer">
+      <span itemprop="price" content="10.00">10,00 €</span><meta itemprop="priceCurrency" content="EUR">
+      <link itemprop="availability" href="http://schema.org/OutOfStock">
+      <div itemprop="itemOffered" itemscope itemtype="http://schema.org/Product">
+        <span itemprop="name">Desk Lamp</span><meta itemprop="gtin8" content="96385074"></div>
+    </div>"""
+    o = extract_offer(html, URL)
+    assert (o.method, o.confidence) == ("microdata", 0.85)
+    assert (o.price, o.currency, o.availability) == (D("10.00"), "EUR", A.OUT_OF_STOCK)
+    assert (o.title, o.gtin) == ("Desk Lamp", "96385074")
+
+
 def test_microdata_related_product_does_not_win_over_page_product() -> None:
     html = """
     <div itemscope itemtype="https://schema.org/Product">
@@ -602,7 +665,10 @@ def test_heuristic_ignores_layout_classes_on_body() -> None:
 
 
 def test_heuristic_header_inside_article_is_not_page_chrome() -> None:
-    html = '<article class="product"><header><h1>Kettle</h1><span class="price">€35</span></header></article>'
+    html = (
+        '<article class="product"><header><h1>Kettle</h1>'
+        '<span class="price">€35</span></header></article>'
+    )
     o = extract_offer(html, URL)
     assert (o.price, o.title) == (D("35"), "Kettle")
 
@@ -689,6 +755,9 @@ def test_availability_from_text(text: str | None, expected: Availability) -> Non
         ('{"a": 1},{"b": 2};', [{"a": 1}, {"b": 2}]),
         ('[{"a": 1}, {"b": 2}]', [[{"a": 1}, {"b": 2}]]),
         ('{"a": "it\\\'s"}', [{"a": "it's"}]),
+        ('{"a": "TV 55" 4K", "b": 1}', [{"a": 'TV 55" 4K', "b": 1}]),
+        ('{"a": "5\\" screen", "b": ["x", "y"]}', [{"a": '5" screen', "b": ["x", "y"]}]),
+        ('{"a": "x"y"}', [{"a": 'x"y'}]),
         ("{&quot;a&quot;: 1}", [{"a": 1}]),
         ('{"a": 1} {broken', [{"a": 1}]),
         ("", []),

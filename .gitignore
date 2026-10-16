@@ -9,3 +9,7 @@ dist/
 build/
 *.egg-info/
 .env
+demo-report.html
+alerts.jsonl
+*.db-wal
+*.db-shm

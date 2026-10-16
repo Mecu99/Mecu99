@@ -302,7 +302,7 @@ class _Graph:
             n for n in self.roots if n.get("offers") and not _types(n) & _OFFER_TYPES
         ]
         if not candidates:
-            return None
+            return self._offer_only_product()
 
         def rank(node: dict[str, Any]) -> tuple[bool, bool, bool]:
             url = _abs(node.get("url"), page_url)
@@ -313,6 +313,23 @@ class _Graph:
             )
 
         return max(candidates, key=rank)
+
+    def _root_offers(self, item_id: str | None = None) -> list[dict[str, Any]]:
+        """Top-level ``Offer`` nodes, optionally only those whose ``itemOffered`` is ``item_id``."""
+        return [
+            n
+            for n in self.roots
+            if _types(n) & _OFFER_TYPES
+            and (item_id is None or any(i.get("@id") == item_id for i in self.nodes(n.get("itemOffered"))))
+        ]
+
+    def _offer_only_product(self) -> dict[str, Any] | None:
+        """Stand-in product for pages marking up bare offers; ``itemOffered`` gives its identity."""
+        offers = self._root_offers()
+        if not offers:
+            return None
+        item = next(iter(self.nodes(offers[0].get("itemOffered"))), {})
+        return {**item, "offers": offers}
 
     def shipping(self, offer: dict[str, Any]) -> Decimal | None:
         for detail in self.nodes(offer.get("shippingDetails")):
@@ -338,7 +355,11 @@ class _Graph:
                 if spec_price := parse_decimal(_first(spec.get("price"))):
                     price, currency = spec_price, currency or _currency(spec.get("priceCurrency"))
                     break
-        currency = currency or next((c for s in specs if (c := _currency(s.get("priceCurrency")))), None)
+        currency = (
+            currency
+            or next((c for s in specs if (c := _currency(s.get("priceCurrency")))), None)
+            or next((c for k in keys if (c := detect_currency(_str(node.get(k))))), None)
+        )
         original = next(
             (p for s in list_specs if (p := parse_decimal(_first(s.get("price")))) is not None),
             None,
@@ -357,7 +378,11 @@ class _Graph:
         )
 
     def offers_of(self, node: dict[str, Any], base: str) -> list[_Offer]:
-        return [self.offer(o, base) for o in self.nodes(node.get("offers"))]
+        """Offers nested in ``node``, else top-level offers whose ``itemOffered`` points at it."""
+        offers = self.nodes(node.get("offers"))
+        if not offers and isinstance(item_id := node.get("@id"), str):
+            offers = self._root_offers(item_id)
+        return [self.offer(o, base) for o in offers]
 
 
 def _structured_layer(docs: list[Any], url: str, method: str) -> ExtractedOffer | None:
@@ -405,6 +430,9 @@ def _structured_layer(docs: list[Any], url: str, method: str) -> ExtractedOffer 
 
 _JSONLD_WRAPPER_RE = re.compile(r"<!--|-->|<!\[CDATA\[|\]\]>|^\s*//.*$", re.MULTILINE)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+# A string value up to the first quote that really closes it (one followed by , } or ]).
+_STRING_VALUE_RE = re.compile(r'(:\s*")(.{0,2000}?)(?="\s*[,}\]])', re.DOTALL)
+_BARE_QUOTE_RE = re.compile(r'(?<!\\)"')
 _JSON_START_RE = re.compile(r"[^\s,;]")
 _DECODER = json.JSONDecoder(strict=False)  # strict=False allows raw control chars in strings
 
@@ -426,12 +454,27 @@ def _repair(text: str) -> str:
     return _TRAILING_COMMA_RE.sub(r"\1", text.replace("\\'", "'"))
 
 
+def _escape_inner_quotes(text: str) -> str:
+    """``"name": "TV 55" 4K",`` -> ``"name": "TV 55\\" 4K",``."""
+    return _STRING_VALUE_RE.sub(lambda m: m.group(1) + _BARE_QUOTE_RE.sub(r'\\"', m.group(2)), text)
+
+
+def _repairs(text: str) -> Iterator[str]:
+    """``text`` and progressively more invasive fixes of it, computed only when needed."""
+    yield text
+    repaired = _repair(text)
+    yield repaired
+    yield _repair(html_lib.unescape(text))
+    yield _escape_inner_quotes(repaired)
+
+
 def load_jsonld(raw: str) -> list[Any]:
     """Leniently parse a JSON-LD script body: comment/CDATA wrappers, trailing commas,
-    raw newlines in strings, HTML-escaped JSON and several concatenated objects."""
+    raw newlines in strings, unescaped quotes in values, HTML-escaped JSON and several
+    concatenated objects."""
     text = _JSONLD_WRAPPER_RE.sub("", raw).strip()
     best: list[Any] = []
-    for candidate in (text, _repair(text), _repair(html_lib.unescape(text))):
+    for candidate in _repairs(text):
         docs, complete = _decode_all(candidate)
         if complete:
             return docs

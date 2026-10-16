@@ -1,0 +1,459 @@
+"""Scan orchestration: discovery, extraction, matching, storage, market analysis and alerts.
+
+:func:`run_scan` is the heart of PriceHunter. For every selected product x enabled competitor
+it registers pinned URLs, (re)discovers candidate pages when needed, reads every listing, and
+records one :class:`Observation` per listing. It then rebuilds each product's market snapshot,
+suggests a price and raises alerts. Failures are recorded as data; one broken competitor or
+product never stops the rest of the scan.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Callable, Coroutine
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any
+
+from .alerts import dispatch, evaluate_alerts
+from .analyze import market_snapshot, suggest_price
+from .discover import discover_candidates
+from .extract import extract_offer
+from .fetch import Fetcher
+from .match import score_match
+from .models import (
+    Alert,
+    AppConfig,
+    Availability,
+    Competitor,
+    ExtractedOffer,
+    FetchResult,
+    Listing,
+    MarketSnapshot,
+    MatchResult,
+    Observation,
+    PriceSuggestion,
+    Product,
+    ScanResult,
+    ScanStats,
+    Settings,
+    utcnow,
+)
+from .storage import Storage
+
+log = logging.getLogger(__name__)
+
+Progress = Callable[[str], None]
+
+PINNED = MatchResult(score=1.0, reason="pinned")
+MAX_MATCHES_PER_PAIR = 2  # allows a second variant listing without letting noise in
+MATCH_LOST = "match lost"
+NO_PRICE = "no price found (check the competitor's selectors)"
+_GONE = frozenset({404, 410})
+
+# --------------------------------------------------------------------------- selection
+
+
+def _select_products(config: AppConfig, skus: list[str] | None) -> tuple[list[Product], list[str]]:
+    """Products to work on (all when ``skus`` is None) and an error per unknown SKU."""
+    if skus is None:
+        return list(config.products), []
+    wanted = set(skus)
+    errors = [f"unknown SKU {sku!r}" for sku in dict.fromkeys(skus) if config.product(sku) is None]
+    return [p for p in config.products if p.sku in wanted], errors
+
+
+def _select_competitors(
+    config: AppConfig, names: list[str] | None
+) -> tuple[list[Competitor], list[str]]:
+    if names is None:
+        return [c for c in config.competitors if c.enabled], []
+    errors: list[str] = []
+    for name in dict.fromkeys(names):
+        found = config.competitor(name)
+        if found is None or not found.enabled:
+            errors.append(f"{'unknown' if found is None else 'disabled'} competitor {name!r}")
+    wanted = set(names)
+    return [c for c in config.competitors if c.enabled and c.name in wanted], errors
+
+
+# --------------------------------------------------------------------------- one run
+
+
+@dataclass
+class _Run:
+    """State shared by every (product, competitor) task of one scan."""
+
+    config: AppConfig
+    storage: Storage
+    run_id: int
+    discover: bool
+    progress: Progress | None
+    stats: ScanStats
+    fetcher: Fetcher = field(init=False)
+    pages: dict[tuple[str, bool], asyncio.Task[FetchResult]] = field(default_factory=dict)
+    sitemaps: dict[str, list[str]] = field(default_factory=dict)
+    observations: list[Observation] = field(default_factory=list)
+    pairs: dict[str, list[tuple[Observation, Observation | None]]] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def settings(self) -> Settings:
+        return self.config.settings
+
+    def say(self, message: str) -> None:
+        log.info(message)
+        if self.progress is not None:
+            self.progress(message)
+
+    def fail(self, message: str) -> None:
+        self.stats.errors += 1
+        self.errors.append(message)
+        self.say(message)
+
+    async def get(
+        self, url: str, competitor: Competitor | None = None, *, render: bool | None = None
+    ) -> FetchResult:
+        """Fetch each page once per run, also under its final URL after redirects.
+
+        The run is the :class:`~pricehunter.discover.PageFetcher` handed to discovery, so a
+        search that redirects to a product page and the later read of that page share one
+        request, and so do candidates and listings.
+        """
+        if render is None:
+            render = competitor.render_js if competitor else False
+        task = self.pages.get((url, render))
+        if task is None:
+            task = asyncio.ensure_future(self.fetcher.get(url, competitor, render=render))
+            self.pages[(url, render)] = task
+        result = await task
+        self.pages.setdefault((result.final_url, render), task)
+        return result
+
+    async def get_bytes(
+        self, url: str, competitor: Competitor | None = None
+    ) -> tuple[FetchResult, bytes]:
+        return await self.fetcher.get_bytes(url, competitor)
+
+    async def guard(self, label: str, work: Coroutine[Any, Any, None]) -> None:
+        """Run one unit of work; an unexpected exception is recorded instead of ending the scan."""
+        try:
+            await work
+        except Exception as exc:
+            log.exception("%s failed", label)
+            self.fail(f"{label}: {type(exc).__name__}: {exc}")
+
+
+def _extract(result: FetchResult, competitor: Competitor) -> ExtractedOffer:
+    return extract_offer(result.html, result.final_url, competitor.selectors, competitor.currency)
+
+
+def _needs_discovery(
+    run: _Run, product: Product, competitor: Competitor, listings: list[Listing]
+) -> bool:
+    """Discover when the pair has no discovered listing, or its last discovery is stale."""
+    if not any(not listing.pinned for listing in listings):
+        return True
+    last = run.storage.last_discovered(product.sku, competitor.name)
+    max_age = timedelta(hours=run.settings.rediscover_after_hours)
+    return last is None or utcnow() - last > max_age
+
+
+async def _discover(
+    run: _Run, product: Product, competitor: Competitor, listings: list[Listing]
+) -> None:
+    """Find candidate pages, keep the best matches as listings and remember when we looked."""
+    settings = run.settings
+    listed = {listing.url for listing in listings}
+    candidates = await discover_candidates(
+        run, competitor, product, settings.max_candidates_per_competitor, run.sitemaps
+    )
+    run.say(f"{competitor.name}: {len(candidates)} candidate(s) for {product.sku}")
+
+    async def check(url: str) -> tuple[MatchResult, str] | None:
+        result = await run.get(url, competitor)
+        run.stats.candidates_checked += 1
+        if not result.ok or result.final_url in listed:
+            return None
+        return score_match(product, _extract(result, competitor)), result.final_url
+
+    checked = await asyncio.gather(*(check(url) for url in candidates if url not in listed))
+    best: dict[str, MatchResult] = {}
+    for match, url in sorted(filter(None, checked), key=lambda c: -c[0].score):
+        if match.score >= settings.match_threshold and url not in best:
+            best[url] = match
+    room = MAX_MATCHES_PER_PAIR - sum(1 for listing in listings if not listing.pinned)
+    for url, match in list(best.items())[: max(room, 0)]:
+        run.storage.upsert_listing(
+            Listing(
+                sku=product.sku,
+                competitor=competitor.name,
+                url=url,
+                match_score=match.score,
+                match_reason=match.reason,
+            )
+        )
+        run.stats.listings_matched += 1
+        run.say(
+            f"{competitor.name}: matched {product.sku} -> {url} ({match.score:.2f}, {match.reason})"
+        )
+    run.storage.mark_discovered(product.sku, competitor.name)
+
+
+async def _observe(run: _Run, product: Product, competitor: Competitor, listing: Listing) -> None:
+    """Read one listing and store the observation (errors included)."""
+    result = await run.get(listing.url, competitor)
+    obs = Observation(
+        run_id=run.run_id,
+        sku=product.sku,
+        competitor=competitor.name,
+        url=listing.url,
+        match_score=listing.match_score,
+        match_reason=listing.match_reason,
+    )
+    if not result.ok:
+        error = result.error or f"HTTP {result.status}"
+        if result.status in _GONE and not listing.pinned:
+            run.storage.deactivate_listing(product.sku, competitor.name, listing.url)
+            error = f"{error} (listing deactivated)"
+        obs.error = error
+        run.fail(f"{competitor.name}: {product.sku}: {listing.url}: {error}")
+    else:
+        offer = _extract(result, competitor)
+        match = PINNED if listing.pinned else score_match(product, offer)
+        error = None
+        if match.score < run.settings.match_threshold:
+            run.storage.deactivate_listing(product.sku, competitor.name, listing.url)
+            error = MATCH_LOST
+            run.say(
+                f"{competitor.name}: {listing.url} no longer matches {product.sku}"
+                f" ({match.score:.2f})"
+            )
+        elif offer.price is None and offer.availability is not Availability.OUT_OF_STOCK:
+            error = NO_PRICE
+            run.fail(f"{competitor.name}: {product.sku}: {listing.url}: {NO_PRICE}")
+        obs = obs.model_copy(
+            update={
+                "title": offer.title,
+                "price": offer.price,
+                "currency": offer.currency,
+                "availability": offer.availability,
+                "original_price": offer.original_price,
+                "shipping": offer.shipping,
+                "match_score": match.score,
+                "match_reason": match.reason,
+                "method": offer.method,
+                "error": error,
+            }
+        )
+        if error != MATCH_LOST:
+            run.storage.upsert_listing(
+                listing.model_copy(
+                    update={
+                        "match_score": match.score,
+                        "match_reason": match.reason,
+                        "last_seen_at": obs.observed_at,
+                    }
+                )
+            )
+    obs_id = run.storage.add_observation(obs)
+    obs = obs.model_copy(update={"id": obs_id})
+    run.observations.append(obs)
+    run.stats.observations += 1
+    if obs.error is None:
+        prev = run.storage.previous_observation(obs.sku, obs.competitor, obs.url, obs_id)
+        run.pairs.setdefault(product.sku, []).append((obs, prev))
+        price = f"{obs.price} {obs.currency or ''}".strip() if obs.price is not None else "no price"
+        run.say(f"{competitor.name}: {product.sku} {price} ({obs.availability.value})")
+
+
+async def _scan_pair(run: _Run, product: Product, competitor: Competitor) -> None:
+    storage = run.storage
+    pinned = list(dict.fromkeys(product.competitor_urls.get(competitor.name, [])))
+    for url in pinned:
+        storage.upsert_listing(
+            Listing(
+                sku=product.sku,
+                competitor=competitor.name,
+                url=url,
+                match_score=PINNED.score,
+                match_reason=PINNED.reason,
+                pinned=True,
+            )
+        )
+    listings: list[Listing] = []
+    for listing in storage.listings(product.sku, competitor.name):
+        if listing.pinned and listing.url not in pinned:  # unpinned in the config since
+            storage.deactivate_listing(listing.sku, listing.competitor, listing.url)
+        else:
+            listings.append(listing)
+    # Pinned URLs replace discovery for this pair (see Product.competitor_urls).
+    if run.discover and not pinned and _needs_discovery(run, product, competitor, listings):
+        await _discover(run, product, competitor, listings)
+    await asyncio.gather(
+        *(
+            run.guard(
+                f"{competitor.name}: {product.sku}: {listing.url}",
+                _observe(run, product, competitor, listing),
+            )
+            for listing in storage.listings(product.sku, competitor.name)
+        )
+    )
+
+
+def _snapshot(
+    config: AppConfig, product: Product, observations: list[Observation]
+) -> MarketSnapshot:
+    settings = config.settings
+    return market_snapshot(
+        product, observations, settings, min_match_score=settings.match_threshold
+    )
+
+
+def _analyze(
+    config: AppConfig, storage: Storage, product: Product
+) -> tuple[MarketSnapshot, PriceSuggestion]:
+    """Current market and repricing suggestion for ``product`` from stored observations."""
+    snapshot = _snapshot(config, product, storage.latest_observations(product.sku))
+    return snapshot, suggest_price(product, snapshot, config.repricing)
+
+
+async def _collect(
+    run: _Run, products: list[Product], competitors: list[Competitor], fetcher: Fetcher | None
+) -> None:
+    """Scan every (product, competitor) pair concurrently; the Fetcher paces the requests."""
+    try:
+        async with AsyncExitStack() as stack:
+            if fetcher is None:
+                fetcher = await stack.enter_async_context(Fetcher(run.settings))
+            run.fetcher = fetcher
+            pages_before = fetcher.pages_fetched
+            await asyncio.gather(
+                *(
+                    run.guard(f"{c.name}: {p.sku}", _scan_pair(run, p, c))
+                    for p in products
+                    for c in competitors
+                )
+            )
+            run.stats.pages_fetched = fetcher.pages_fetched - pages_before
+    except Exception as exc:  # e.g. an invalid proxy URL; the stored data stays usable
+        log.exception("scan %s aborted", run.run_id)
+        run.fail(f"scan aborted: {type(exc).__name__}: {exc}")
+
+
+def _evaluate(
+    run: _Run, products: list[Product]
+) -> tuple[list[MarketSnapshot], list[PriceSuggestion], list[Alert]]:
+    """Snapshot, suggestion and alerts per product, comparing with the market before this run."""
+    config, storage = run.config, run.storage
+    snapshots: list[MarketSnapshot] = []
+    suggestions: list[PriceSuggestion] = []
+    alerts: list[Alert] = []
+    for product in products:
+        try:
+            snapshot, suggestion = _analyze(config, storage, product)
+            previous = storage.latest_observations(product.sku, before_run=run.run_id)
+            prev_snapshot = _snapshot(config, product, previous) if previous else None
+            pairs = run.pairs.get(product.sku, [])
+            found = evaluate_alerts(product, pairs, snapshot, prev_snapshot, config.alerts)
+        except Exception as exc:
+            log.exception("analysis of %s failed", product.sku)
+            run.fail(f"{product.sku}: analysis failed: {type(exc).__name__}: {exc}")
+            continue
+        snapshots.append(snapshot)
+        suggestions.append(suggestion)
+        alerts.extend(found)
+    return snapshots, suggestions, alerts
+
+
+async def run_scan(
+    config: AppConfig,
+    storage: Storage,
+    *,
+    skus: list[str] | None = None,
+    competitors: list[str] | None = None,
+    discover: bool = True,
+    notify: bool = True,
+    fetcher: Fetcher | None = None,
+    progress: Progress | None = None,
+) -> ScanResult:
+    """Scan the selected products on the selected (enabled) competitors and store the results.
+
+    A ``fetcher`` passed in must already be open (``async with``); otherwise one is created
+    from ``config.settings``. ``progress`` receives short human-readable status lines.
+    Problems are reported in ``ScanResult.errors``; the run is always finished in storage.
+    """
+    products, errors = _select_products(config, skus)
+    targets, competitor_errors = _select_competitors(config, competitors)
+    run_id = storage.start_run()
+    stats = ScanStats(run_id=run_id, products=len(products))
+    run = _Run(
+        config, storage, run_id, discover, progress, stats, errors=errors + competitor_errors
+    )
+    snapshots: list[MarketSnapshot] = []
+    suggestions: list[PriceSuggestion] = []
+    alerts: list[Alert] = []
+    try:
+        await _collect(run, products, targets, fetcher)
+        snapshots, suggestions, alerts = _evaluate(run, products)
+        storage.add_alerts(run_id, alerts)
+        stats.alerts = len(alerts)
+        if notify and alerts:
+            run.errors.extend(await dispatch(alerts, config.notifiers))
+    finally:
+        stats.finished_at = utcnow()
+        storage.finish_run(run_id, stats)
+    return ScanResult(
+        stats=stats,
+        observations=run.observations,
+        snapshots=snapshots,
+        suggestions=suggestions,
+        alerts=alerts,
+        errors=run.errors,
+    )
+
+
+# --------------------------------------------------------------------------- reporting helpers
+
+
+def build_snapshots(
+    config: AppConfig, storage: Storage, skus: list[str] | None = None
+) -> tuple[list[MarketSnapshot], list[PriceSuggestion]]:
+    """Market snapshots and repricing suggestions from stored observations (no network)."""
+    analyzed = [_analyze(config, storage, p) for p in _select_products(config, skus)[0]]
+    return [s for s, _ in analyzed], [g for _, g in analyzed]
+
+
+def load_history(
+    config: AppConfig, storage: Storage, skus: list[str] | None = None, days: float | None = 30
+) -> dict[str, list[Observation]]:
+    """Successful observations per SKU (oldest first), limited to the last ``days`` days."""
+    since = utcnow() - timedelta(days=days) if days else None
+    return {p.sku: storage.history(p.sku, since=since) for p in _select_products(config, skus)[0]}
+
+
+async def probe(
+    url: str,
+    competitor: Competitor | None,
+    settings: Settings,
+    product: Product | None = None,
+    *,
+    render: bool | None = None,
+) -> tuple[FetchResult, ExtractedOffer, MatchResult | None]:
+    """Fetch and extract one page as a scan would; score it against ``product`` when given.
+
+    Handy for configuring selectors. ``render`` overrides ``competitor.render_js``.
+    The match is ``None`` without a product or when the fetch failed.
+    """
+    async with Fetcher(settings) as fetcher:
+        result = await fetcher.get(url, competitor, render=render)
+    if not result.ok:
+        return result, ExtractedOffer(url=result.final_url), None
+    offer = (
+        _extract(result, competitor)
+        if competitor is not None
+        else extract_offer(result.html, result.final_url)
+    )
+    return result, offer, score_match(product, offer) if product is not None else None

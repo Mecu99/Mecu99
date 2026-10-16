@@ -29,12 +29,17 @@ CENT = Decimal("0.01")
 
 
 def normalize_currency(raw: str | None) -> str | None:
+    """ISO-4217 code for a symbol, local name or code; unknown 3-letter codes pass through.
+
+    Aliases are checked first so local names that happen to have three letters
+    ("lei", "leu") map to their ISO code instead of being taken as one.
+    """
     if not raw:
         return None
     s = raw.strip()
-    if len(s) == 3 and s.isalpha():
-        return s.upper()
-    return CURRENCY_ALIASES.get(s.lower())
+    if alias := CURRENCY_ALIASES.get(s.lower()):
+        return alias
+    return s.upper() if len(s) == 3 and s.isalpha() else None
 
 
 def convert(

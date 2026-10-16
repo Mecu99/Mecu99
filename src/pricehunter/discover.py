@@ -17,10 +17,19 @@ from collections import deque
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import Protocol
-from urllib.parse import parse_qsl, quote_plus, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    quote_plus,
+    unquote,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 from bs4 import BeautifulSoup, Tag
 from lxml import etree
+from soupsieve import SelectorSyntaxError
 
 from .match import model_tokens, normalize_gtin, normalize_text, score_match
 from .models import Competitor, ExtractedOffer, FetchResult, Product
@@ -120,11 +129,12 @@ _PRODUCT_SEGMENTS = frozenset({
 _PRODUCT_PATH = re.compile(r"-p-\d|[-_]pid[-_]?\d|\.html?$|\.php$")
 _PRODUCT_PARAMS = frozenset({"id", "pid", "product_id", "productid", "products_id", "item_id", "sku"})
 _SLUG_WITH_ID = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+){2,}$")
+_ID_TAIL = re.compile(r"[a-z][-_]\d{4,}$")
 
 
 def _host_key(host: str | None) -> str:
     host = (host or "").lower().rstrip(".")
-    return host[4:] if host.startswith("www.") else host
+    return host.removeprefix("www.")
 
 
 @lru_cache(maxsize=256)
@@ -176,6 +186,8 @@ def _looks_like_product(url: str) -> bool:
     if any(seg.isdigit() and len(seg) >= 5 for seg in segments):
         return True
     last = re.sub(r"\.[a-z0-9]{2,5}$", "", segments[-1]) if segments else ""
+    if _ID_TAIL.search(last):
+        return True  # "item-123456"
     return bool(_SLUG_WITH_ID.match(last)) and any(c.isdigit() for c in last)
 
 
@@ -231,7 +243,7 @@ def extract_links(html: str, page_url: str, competitor: Competitor) -> list[str]
     if selector:
         try:
             elements = soup.select(selector)
-        except Exception as exc:  # soupsieve.SelectorSyntaxError and friends
+        except SelectorSyntaxError as exc:
             log.warning("%s: bad search_result_link selector %r: %s", competitor.name, selector, exc)
         else:
             hrefs = (h for el in elements if (h := _href_of(el)))
@@ -262,17 +274,19 @@ async def search_competitor(
 ) -> list[str]:
     """Run :func:`build_queries` through the competitor's site search until ``limit`` URLs.
 
-    A search that redirects straight to a product page (common for exact GTIN/MPN hits)
-    contributes that page first. Failed fetches are skipped.
+    A search that redirects straight to a product page (common for exact GTIN/MPN hits) is the
+    strongest signal there is, so such landing pages come before every result-list link.
+    Failed fetches are skipped.
     """
     if not competitor.search_url or limit <= 0:
         return []
     site = _host_key(urlsplit(competitor.base_url).hostname)
     pattern = _compile(competitor.product_url_pattern)
+    landings: dict[str, None] = {}
     found: dict[str, None] = {}
     searched: set[str] = set()
     for query in build_queries(product):
-        if len(found) >= limit:
+        if len(landings.keys() | found.keys()) >= limit:
             break
         url = _search_url(competitor, query)
         if url in searched:
@@ -287,12 +301,12 @@ async def search_competitor(
             if _redirected(url, final):
                 landing = _clean_url(final, final, site, pattern)
                 if landing and not _is_junk(landing):
-                    found.setdefault(landing)
+                    landings.setdefault(landing)
             for link in extract_links(result.html, final, competitor):
                 found.setdefault(link)
         except Exception:
             log.exception("%s: search %r crashed", competitor.name, query)
-    return list(found)[:limit]
+    return _dedupe([*landings, *found])[:limit]
 
 
 # --------------------------------------------------------------------------- sitemaps
@@ -363,10 +377,11 @@ def parse_sitemap(xml_text: str) -> tuple[list[str], list[str]]:
     return _parse_regex(text)
 
 
-def _gunzip(body: bytes, cap: int = MAX_SITEMAP_BYTES) -> bytes | None:
-    """Decompress a ``.gz`` sitemap, refusing more than ``cap`` bytes (decompression bombs)."""
+def _gunzip(body: bytes) -> bytes | None:
+    """Decompress a ``.gz`` sitemap, refusing more than ``MAX_SITEMAP_BYTES`` (decompression bombs)."""
     if body[:2] != b"\x1f\x8b":
         return body  # served with Content-Encoding: gzip and already decoded in transit
+    cap = MAX_SITEMAP_BYTES
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(body)) as gz:
             data = gz.read(cap + 1)
@@ -374,7 +389,7 @@ def _gunzip(body: bytes, cap: int = MAX_SITEMAP_BYTES) -> bytes | None:
         log.warning("corrupt gzip sitemap: %s", exc)
         return None
     if len(data) > cap:
-        log.warning("gzip sitemap expands beyond %d MB; skipped", cap // (1024 * 1024))
+        log.warning("gzip sitemap expands beyond %d bytes; skipped", cap)
         return None
     return data
 
@@ -393,19 +408,20 @@ async def _sitemap_roots(fetcher: PageFetcher, competitor: Competitor) -> list[s
     if competitor.sitemap_url:
         return [urljoin(competitor.base_url, competitor.sitemap_url)]
     robots = await fetcher.get(urljoin(competitor.base_url, "/robots.txt"), competitor, render=False)
-    declared = (
-        re.findall(r"(?im)^\s*sitemap\s*:\s*(\S+)", robots.html) if robots.ok else []
-    )
+    declared = re.findall(r"(?im)^\s*sitemap\s*:\s*(\S+)", robots.html) if robots.ok else []
     return _dedupe(declared) or [urljoin(competitor.base_url, "/sitemap.xml")]
 
 
-_PRODUCT_SITEMAP = re.compile(r"product|produs|item|catalog|shop")
-_OTHER_SITEMAP = re.compile(r"blog|post|news|article|categor|tag|author|brand|page|image|video|static")
+# Anchored on a word start: "sitemap" itself contains "item".
+_PRODUCT_SITEMAP = re.compile(r"(?<![a-z])(?:product|produs|item|catalog|shop)")
+_OTHER_SITEMAP = re.compile(
+    r"(?<![a-z])(?:blog|post|news|article|categor|tag|author|brand|page|image|video|static)"
+)
 
 
 def _sitemap_priority(url: str) -> int:
-    """Visit product sitemaps first and editorial/category ones last."""
-    name = url.lower()
+    """Visit product sitemaps first and editorial/category ones last (judged by the path only)."""
+    name = urlsplit(url).path.lower()
     return 0 if _PRODUCT_SITEMAP.search(name) else 2 if _OTHER_SITEMAP.search(name) else 1
 
 
@@ -446,17 +462,23 @@ async def sitemap_urls(
 # --------------------------------------------------------------------------- sitemap ranking
 
 _EXTENSION = re.compile(r"\.(?:html?|php|aspx?|jsp)$")
-_LONG_ID = re.compile(r"^\d{6,}$")
+_ID_SUFFIX = re.compile(r"[-_](?:p|pd|pid|id|i|sku|prod)[-_]?\d+$")
+_LONG_ID = re.compile(r"^\d{5,}$")
 
 
 def _url_slug(url: str, keep: set[str]) -> str:
-    """Readable words from the last meaningful path segments ("/apple-iphone-15-128gb-p123.html").
+    """Readable words from the last meaningful path segments ("/apple-iphone-15-128gb-p-123.html").
 
-    Marker segments (``/p/``, ``/product/``), long numeric ids and extensions are dropped unless
-    the number also appears in ``keep`` (e.g. a LEGO set number in our product name).
+    Marker segments (``/p/``, ``/product/``), id suffixes (``-p-123``), long numeric ids and
+    extensions are dropped; a long number survives when it also appears in ``keep`` (e.g. a
+    LEGO set number in our product name).
     """
     path = unquote(urlsplit(url).path).lower()
-    segments = [_EXTENSION.sub("", s) for s in path.split("/") if s and s not in _PRODUCT_SEGMENTS]
+    segments = [
+        _ID_SUFFIX.sub("", _EXTENSION.sub("", s))
+        for s in path.split("/")
+        if s and s not in _PRODUCT_SEGMENTS
+    ]
     words: list[str] = []
     for segment in segments[-2:]:
         tokens = re.split(r"[-_+.\s]+", segment)
@@ -470,8 +492,8 @@ def rank_sitemap_urls(
     """The ``limit`` sitemap URLs whose slugs best match ``product``, scoring >= ``min_score``.
 
     Slugs are scored with :func:`pricehunter.match.score_match` (so accessory, variant and spec
-    guards apply), boosted when they contain our MPN or a model token, and a URL carrying our
-    GTIN wins outright.
+    guards apply). A URL carrying our GTIN wins outright, one carrying our MPN ranks just below
+    it, and a shared model token adds 0.1.
     """
     if limit <= 0 or not urls:
         return []
@@ -479,7 +501,7 @@ def rank_sitemap_urls(
     keep = set(product_text.split())
     words = {w for w in keep if len(w) >= 3 and not w.isdigit()}
     mpn = re.sub(r"[^a-z0-9]", "", (product.mpn or "").lower())
-    models = {m for m in model_tokens(f"{product.name} {product.mpn or ''}") if len(m) >= 4}
+    models = model_tokens(f"{product.name} {product.mpn or ''}")
     gtin = normalize_gtin(product.gtin)
 
     scored: list[tuple[float, int, str]] = []
@@ -496,9 +518,9 @@ def rank_sitemap_urls(
             continue
         result = score_match(product, ExtractedOffer(url=url, title=slug))
         score = result.score
-        if result.reason == "title":
-            if len(mpn) >= 4 and mpn in compact:
-                score += 0.2
+        if result.reason == "title":  # no conflict found, so identifiers in the URL can lift it
+            if len(mpn) >= 5 and mpn in compact:
+                score = max(score, 0.97)
             elif any(m in compact for m in models):
                 score += 0.1
         if score >= min_score:

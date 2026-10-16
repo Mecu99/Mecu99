@@ -341,16 +341,22 @@ async def test_retries_exhausted_returns_last_status() -> None:
     assert len(seen) == 3 and len(rec.sleeps) == 2
 
 
+def _http_date_in_30s() -> str:
+    # Built when the test runs: collection can happen many seconds earlier in a full suite.
+    return email.utils.format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+
+
 @pytest.mark.parametrize(
-    "header,expected",
+    "make_header,expected",
     [
-        ("7", 7.0),
-        ("3600", 60.0),  # capped
-        (email.utils.format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True), 30.0),
+        (lambda: "7", 7.0),
+        (lambda: "3600", 60.0),  # capped
+        (_http_date_in_30s, 30.0),
     ],
+    ids=["seconds", "capped", "http-date"],
 )
-async def test_retry_after_is_honoured(header: str, expected: float) -> None:
-    handler, _ = sequence(html("slow down", 429, **{"Retry-After": header}), html())
+async def test_retry_after_is_honoured(make_header: Callable[[], str], expected: float) -> None:
+    handler, _ = sequence(html("slow down", 429, **{"Retry-After": make_header()}), html())
     rec = Recorder()
     fetcher = Fetcher(settings(), transport=httpx.MockTransport(handler), backoff_base=0.0, sleep=rec)
     async with fetcher as f:
