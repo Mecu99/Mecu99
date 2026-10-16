@@ -11,15 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from .alerts import dispatch, evaluate_alerts
-from .analyze import market_snapshot, suggest_price
+from .analyze import market_snapshot, missing_rates, product_currency, reprice
 from .discover import discover_candidates
 from .extract import VERDICTS, extract_offer
 from .fetch import Fetcher
@@ -54,6 +55,8 @@ MAX_MATCHES_PER_PAIR = 2  # allows a second variant listing without letting nois
 IDENTIFIED = frozenset({"gtin", "mpn"})  # match reasons that pin down the exact item
 # A new title-only match priced under this share of ours is likelier a part than a bargain.
 MIN_PLAUSIBLE_PRICE_RATIO = Decimal("0.4")
+# A listing's last good reading stands in for failed fetches this long, then stops counting.
+FALLBACK_MAX_AGE = timedelta(days=7)
 MATCH_LOST = "match lost"
 NO_PRICE = "no price found (check the competitor's selectors)"
 _GONE = frozenset({404, 410})
@@ -114,7 +117,6 @@ class _Run:
             self.progress(message)
 
     def fail(self, message: str) -> None:
-        self.stats.errors += 1
         self.errors.append(message)
         self.say(message)
 
@@ -178,8 +180,18 @@ def _implausibly_cheap(
     if match.reason != "title" or offer.price is None or not product.our_price:
         return False
     rates, base = settings.currency_rates, settings.base_currency
-    price = convert(offer.price, offer.currency, product.currency, rates, base)
+    price = convert(offer.price, offer.currency, product_currency(product), rates, base)
     return price is not None and price < product.our_price * MIN_PLAUSIBLE_PRICE_RATIO
+
+
+def _moved(url: str, final_url: str) -> bool:
+    """Whether a request ended on another page: a different path, not merely another scheme,
+    host spelling, letter case, percent-encoding or trailing slash."""
+
+    def page(address: str) -> str:
+        return unquote(urlsplit(address).path).rstrip("/").lower()
+
+    return page(url) != page(final_url)
 
 
 async def _discover(
@@ -187,8 +199,9 @@ async def _discover(
 ) -> None:
     """Find candidate pages, keep the best matches as listings and remember when we looked.
 
-    Once a GTIN or MPN pins the exact item down, title-only look-alikes (a used unit, another
-    variant) are not kept next to it.
+    The pair's current listings compete with the new matches (and win ties), so a better page
+    replaces a weak listing, which is deactivated. Once a GTIN or MPN pins the exact item down,
+    title-only look-alikes (a used unit, another variant) are not kept next to it.
     """
     settings = run.settings
     listed = {listing.url for listing in listings}
@@ -209,21 +222,30 @@ async def _discover(
         return score_match(product, offer), result.final_url, offer
 
     checked = await asyncio.gather(*(check(url) for url in candidates if url not in listed))
-    best: dict[str, MatchResult] = {}
+    found: dict[str, MatchResult] = {}
     for match, url, offer in sorted(filter(None, checked), key=lambda c: -c[0].score):
-        if match.score < settings.match_threshold or url in best:
+        if match.score < settings.match_threshold or url in found:
             continue
         if _implausibly_cheap(settings, product, offer, match):
             price = f"{offer.price} {offer.currency or ''}".strip()
             run.say(f"{competitor.name}: skipped {url} for {product.sku}: {price} is too cheap")
             continue
-        best[url] = match
-    if any(m.reason in IDENTIFIED for m in best.values()) or any(
-        listing.match_reason in IDENTIFIED for listing in listings
-    ):
-        best = {url: match for url, match in best.items() if match.reason in IDENTIFIED}
-    room = MAX_MATCHES_PER_PAIR - sum(1 for listing in listings if not listing.pinned)
-    for url, match in list(best.items())[: max(room, 0)]:
+        found[url] = match
+    current = {
+        listing.url: MatchResult(score=listing.match_score, reason=listing.match_reason)
+        for listing in listings
+        if not listing.pinned
+    }
+    ranked = sorted({**current, **found}.items(), key=lambda item: -item[1].score)
+    if any(match.reason in IDENTIFIED for _, match in ranked):
+        ranked = [(url, match) for url, match in ranked if match.reason in IDENTIFIED]
+    keep = dict(ranked[:MAX_MATCHES_PER_PAIR])
+    for url in (url for url in current if url not in keep):
+        run.storage.deactivate_listing(product.sku, competitor.name, url)
+        run.say(f"{competitor.name}: replaced {url} for {product.sku} with a better match")
+    for url, match in keep.items():
+        if url in current:
+            continue
         run.storage.upsert_listing(
             Listing(
                 sku=product.sku,
@@ -238,6 +260,21 @@ async def _discover(
             f"{competitor.name}: matched {product.sku} -> {url} ({match.score:.2f}, {match.reason})"
         )
     run.storage.mark_discovered(product.sku, competitor.name)
+
+
+def _pinned_page_lost(
+    settings: Settings, product: Product, result: FetchResult, offer: ExtractedOffer
+) -> str | None:
+    """Why a pinned URL that now redirects elsewhere no longer shows ``product``, if it does not.
+
+    Shops send a delisted product's URL to its category or home page. Pinned pages are trusted
+    without matching, so a redirected one has to pass the matcher like a discovered page.
+    """
+    match = score_match(product, offer)
+    if offer.method not in VERDICTS and match.score >= settings.match_threshold:
+        return None
+    why = VERDICTS.get(offer.method) or f"match {match.score:.2f}"
+    return f"pinned URL now redirects to {result.final_url} ({why}); pin the product's new URL"
 
 
 async def _observe(run: _Run, product: Product, competitor: Competitor, listing: Listing) -> None:
@@ -262,9 +299,14 @@ async def _observe(run: _Run, product: Product, competitor: Competitor, listing:
         offer = _extract(result, competitor, product)
         match = PINNED if listing.pinned else score_match(product, offer)
         error = None
-        if match.score < run.settings.match_threshold:
+        if listing.pinned and _moved(listing.url, result.final_url):
+            error = _pinned_page_lost(run.settings, product, result, offer)
+        lost = error is not None  # the page no longer shows this listing's product
+        if lost:
+            run.fail(f"{competitor.name}: {product.sku}: {listing.url}: {error}")
+        elif match.score < run.settings.match_threshold:
             run.storage.deactivate_listing(product.sku, competitor.name, listing.url)
-            error = MATCH_LOST
+            lost, error = True, MATCH_LOST
             run.say(
                 f"{competitor.name}: {listing.url} no longer matches {product.sku}"
                 f" ({match.score:.2f})"
@@ -287,7 +329,7 @@ async def _observe(run: _Run, product: Product, competitor: Competitor, listing:
                 "error": error,
             }
         )
-        if error != MATCH_LOST:
+        if not lost:
             run.storage.upsert_listing(
                 listing.model_copy(
                     update={
@@ -324,11 +366,12 @@ async def _scan_pair(run: _Run, product: Product, competitor: Competitor) -> Non
         )
     listings: list[Listing] = []
     for listing in storage.listings(product.sku, competitor.name):
-        if listing.pinned and listing.url not in pinned:  # unpinned in the config since
+        # Unpinned in the config since, or a discovered page that pinned URLs now replace.
+        if listing.url not in pinned and (listing.pinned or bool(pinned)):
             storage.deactivate_listing(listing.sku, listing.competitor, listing.url)
         else:
             listings.append(listing)
-    # Pinned URLs replace discovery for this pair (see Product.competitor_urls).
+    # Pinned URLs replace discovery and its listings for this pair (see Product.competitor_urls).
     if run.discover and not pinned and _needs_discovery(run, product, competitor, listings):
         await _discover(run, product, competitor, listings)
     await asyncio.gather(
@@ -342,6 +385,28 @@ async def _scan_pair(run: _Run, product: Product, competitor: Competitor) -> Non
     )
 
 
+def _readings(
+    config: AppConfig, storage: Storage, product: Product, before_run: int | None = None
+) -> list[Observation]:
+    """The latest good reading of each of ``product``'s listings that is still part of its market.
+
+    Competitors that are disabled or no longer configured drop out, and so do discovered pages
+    where the product now pins URLs for that competitor. A last good reading stands in for
+    failed fetches for at most :data:`FALLBACK_MAX_AGE`.
+    """
+    enabled = {c.name for c in config.competitors if c.enabled}
+    pins = product.competitor_urls
+    latest = storage.latest_observations(
+        product.sku, before_run=before_run, max_fallback_age=FALLBACK_MAX_AGE
+    )
+    return [
+        obs
+        for obs in latest
+        if obs.competitor in enabled
+        and (not pins.get(obs.competitor) or obs.url in pins[obs.competitor])
+    ]
+
+
 def _snapshot(
     config: AppConfig, product: Product, observations: list[Observation]
 ) -> MarketSnapshot:
@@ -352,11 +417,29 @@ def _snapshot(
 
 
 def _analyze(
-    config: AppConfig, storage: Storage, product: Product
+    config: AppConfig, product: Product, observations: list[Observation]
 ) -> tuple[MarketSnapshot, PriceSuggestion]:
-    """Current market and repricing suggestion for ``product`` from stored observations."""
-    snapshot = _snapshot(config, product, storage.latest_observations(product.sku))
-    return snapshot, suggest_price(product, snapshot, config.repricing)
+    """Market and repricing suggestion for ``product`` from its :func:`_readings`."""
+    settings = config.settings
+    suggestion = reprice(
+        product, observations, settings, config.repricing, settings.match_threshold
+    )
+    return _snapshot(config, product, observations), suggestion
+
+
+def _rate_errors(
+    config: AppConfig, markets: Iterable[tuple[Product, list[Observation]]]
+) -> list[str]:
+    """One error per currency without a rate, naming the competitors it leaves out."""
+    missing: dict[str, set[str]] = {}
+    for product, readings in markets:
+        for code, names in missing_rates(product, readings, config.settings).items():
+            missing.setdefault(code, set()).update(names)
+    return [
+        f"no currency rate for {code} in settings.currency_rates:"
+        f" prices from {', '.join(sorted(names))} are left out of the market"
+        for code, names in sorted(missing.items())
+    ]
 
 
 async def _collect(
@@ -390,10 +473,12 @@ def _evaluate(
     snapshots: list[MarketSnapshot] = []
     suggestions: list[PriceSuggestion] = []
     alerts: list[Alert] = []
+    markets: list[tuple[Product, list[Observation]]] = []
     for product in products:
         try:
-            snapshot, suggestion = _analyze(config, storage, product)
-            previous = storage.latest_observations(product.sku, before_run=run.run_id)
+            current = _readings(config, storage, product)
+            snapshot, suggestion = _analyze(config, product, current)
+            previous = _readings(config, storage, product, before_run=run.run_id)
             prev_snapshot = _snapshot(config, product, previous) if previous else None
             pairs = run.pairs.get(product.sku, [])
             found = evaluate_alerts(product, pairs, snapshot, prev_snapshot, config.alerts)
@@ -401,9 +486,12 @@ def _evaluate(
             log.exception("analysis of %s failed", product.sku)
             run.fail(f"{product.sku}: analysis failed: {type(exc).__name__}: {exc}")
             continue
+        markets.append((product, current))
         snapshots.append(snapshot)
         suggestions.append(suggestion)
         alerts.extend(found)
+    for error in _rate_errors(config, markets):
+        run.fail(error)
     return snapshots, suggestions, alerts
 
 
@@ -442,6 +530,7 @@ async def run_scan(
         if notify and alerts:
             run.errors.extend(await dispatch(alerts, config.notifiers))
     finally:
+        stats.errors = len(run.errors)
         stats.finished_at = utcnow()
         storage.finish_run(run_id, stats)
     return ScanResult(
@@ -461,8 +550,19 @@ def build_snapshots(
     config: AppConfig, storage: Storage, skus: list[str] | None = None
 ) -> tuple[list[MarketSnapshot], list[PriceSuggestion]]:
     """Market snapshots and repricing suggestions from stored observations (no network)."""
-    analyzed = [_analyze(config, storage, p) for p in _select_products(config, skus)[0]]
+    analyzed = [
+        _analyze(config, p, _readings(config, storage, p))
+        for p in _select_products(config, skus)[0]
+    ]
     return [s for s, _ in analyzed], [g for _, g in analyzed]
+
+
+def market_warnings(
+    config: AppConfig, storage: Storage, skus: list[str] | None = None
+) -> list[str]:
+    """Problems that silently keep stored prices out of :func:`build_snapshots` (no network)."""
+    products = _select_products(config, skus)[0]
+    return _rate_errors(config, ((p, _readings(config, storage, p)) for p in products))
 
 
 def load_history(

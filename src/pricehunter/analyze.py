@@ -15,9 +15,14 @@ from .models import (
     RepricingRule,
     Settings,
 )
-from .money import CENT, convert, quantize
+from .money import CENT, convert, normalize_currency, quantize
 
 _ZERO = Decimal(0)
+
+
+def product_currency(product: Product) -> str:
+    """ISO code of ``product.currency``, which the config may spell ``eur``, ``€`` or ``lei``."""
+    return normalize_currency(product.currency) or product.currency.upper()
 
 
 def _available(offer: CompetitorPrice) -> bool:
@@ -31,16 +36,15 @@ def _num(value: Decimal) -> str:
 
 
 def _offer(obs: Observation, product: Product, settings: Settings) -> CompetitorPrice | None:
-    """Convert one observation into ``product.currency``; ``None`` if it cannot be priced."""
+    """Convert one observation into the product's currency; ``None`` if it cannot be priced."""
     if obs.price is None or obs.price <= 0:
         return None
     amount = obs.price
     if settings.include_shipping and obs.shipping is not None:
         amount += obs.shipping
     currency = obs.currency.upper() if obs.currency else None
-    converted = convert(
-        amount, currency, product.currency, settings.currency_rates, settings.base_currency
-    )
+    rates, base = settings.currency_rates, settings.base_currency
+    converted = convert(amount, currency, product_currency(product), rates, base)
     if converted is None:
         return None
     return CompetitorPrice(
@@ -67,10 +71,10 @@ def market_snapshot(
 ) -> MarketSnapshot:
     """Summarise the market for ``product`` from its competitors' latest observations.
 
-    Prices are converted into ``product.currency`` (with shipping when
+    Prices are converted into the product's currency (with shipping when
     ``settings.include_shipping``); observations without a usable price, below
-    ``min_match_score`` or in a currency without a known rate are ignored. Each
-    competitor contributes one offer. The summary statistics, rank and
+    ``min_match_score`` or in a currency without a known rate (see :func:`missing_rates`)
+    are ignored. Each competitor contributes one offer. The summary statistics, rank and
     ``in_stock_offers`` count only offers that are not out of stock.
     """
     by_competitor: dict[str, list[CompetitorPrice]] = {}
@@ -90,7 +94,7 @@ def market_snapshot(
     our_price = product.our_price
     snapshot = MarketSnapshot(
         sku=product.sku,
-        currency=product.currency,
+        currency=product_currency(product),
         our_price=our_price,
         offers=offers,
         in_stock_offers=len(available),
@@ -107,6 +111,27 @@ def market_snapshot(
         if snapshot.median:
             snapshot.price_index = round(float(our_price / snapshot.median * 100), 1)
     return snapshot
+
+
+def missing_rates(
+    product: Product, observations: list[Observation], settings: Settings
+) -> dict[str, set[str]]:
+    """Currencies lacking a rate that :func:`market_snapshot` needs for ``product``, each with
+    the competitors whose prices are left out for it (a wrong or missing rate is otherwise silent).
+    """
+    target = product_currency(product)
+    known = {code.upper() for code in settings.currency_rates} | {settings.base_currency.upper()}
+    missing: dict[str, set[str]] = {}
+    for obs in observations:
+        if obs.sku != product.sku or not obs.price:
+            continue
+        source = (obs.currency or target).upper()
+        rates, base = settings.currency_rates, settings.base_currency
+        if convert(obs.price, source, target, rates, base) is not None:
+            continue
+        for code in {source, target} - known or {source}:
+            missing.setdefault(code, set()).add(obs.competitor)
+    return missing
 
 
 # --------------------------------------------------------------------------- repricing
@@ -238,3 +263,22 @@ def suggest_price(
             reasons.append(f"price ending {ending}")
 
     return result(price, "; ".join(reasons))
+
+
+def reprice(
+    product: Product,
+    observations: list[Observation],
+    settings: Settings,
+    rule: RepricingRule,
+    min_match_score: float = 0.0,
+) -> PriceSuggestion:
+    """:func:`suggest_price` over a market built only from the listings ``rule`` trusts.
+
+    Each competitor's offer is chosen among its listings scoring at least
+    ``rule.min_match_score``, so a cheaper but doubtful listing cannot hide the same
+    competitor's confident one from the repricing.
+    """
+    trusted = market_snapshot(
+        product, observations, settings, max(min_match_score, rule.min_match_score)
+    )
+    return suggest_price(product, trusted, rule)
