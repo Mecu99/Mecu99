@@ -119,18 +119,17 @@ def missing_rates(
     """Currencies lacking a rate that :func:`market_snapshot` needs for ``product``, each with
     the competitors whose prices are left out for it (a wrong or missing rate is otherwise silent).
     """
+    rates, base = settings.currency_rates, settings.base_currency
     target = product_currency(product)
-    known = {code.upper() for code in settings.currency_rates} | {settings.base_currency.upper()}
+    known = {code.upper() for code in rates} | {base.upper()}
     missing: dict[str, set[str]] = {}
     for obs in observations:
+        source = (obs.currency or target).upper()
         if obs.sku != product.sku or not obs.price:
             continue
-        source = (obs.currency or target).upper()
-        rates, base = settings.currency_rates, settings.base_currency
-        if convert(obs.price, source, target, rates, base) is not None:
-            continue
-        for code in {source, target} - known or {source}:
-            missing.setdefault(code, set()).add(obs.competitor)
+        if convert(obs.price, source, target, rates, base) is None:
+            for code in {source, target} - known or {target}:  # both known: a zero rate
+                missing.setdefault(code, set()).add(obs.competitor)
     return missing
 
 
@@ -201,7 +200,8 @@ def suggest_price(
     The floor is the higher of ``product.min_price`` and cost plus the minimum margin
     (rounded up to cents); the ceiling is ``product.max_price`` (rounded down). When the
     floor exceeds the ceiling the floor wins. Without any qualifying competitor offer
-    the current price is kept.
+    the current price is kept. :func:`reprice` builds the snapshot so that each competitor's
+    offer is its best one among the listings the rule trusts.
     """
     current = product.our_price
     floor, floor_source = _floor(product, rule)

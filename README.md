@@ -82,9 +82,9 @@ Every command reads `./pricehunter.yaml` by default. Use `-c/--config PATH` or s
 | Command | What it does |
 |---|---|
 | `init [PATH] [--force]` | Write the commented example config (refuses to overwrite without `--force`). |
-| `scan [--sku S]... [--competitor C]... [--no-discover] [--no-notify] [--report out.html\|.csv\|.json] [-v]` | Discover, read prices, analyse, alert. Prints the market table and run statistics. |
+| `scan [--sku S]... [--competitor C]... [--no-discover] [--no-notify] [--report out.html\|.csv\|.json] [--strict] [-v]` | Discover, read prices, analyse, alert. Prints the market table and run statistics. With `--strict` it exits with code 3 when the run reported errors. |
 | `watch [--every 60m] [--max-runs N]` | Scan on an interval (`30s`, `15m`, `2h`, `1d`). Ctrl-C stops it; config edits apply from the next scan. |
-| `prices [--sku S]...` | Market position from stored data (no network). |
+| `prices [--sku S]...` | Market position from stored data (no network). Warns about currencies without a rate. |
 | `suggest [--sku S]...` | Repricing suggestions with the reasoning behind each one. |
 | `history SKU [--competitor C] [--days 30]` | Every reading, plus a text sparkline per competitor listing. |
 | `alerts [--limit 20] [--sku S]` | Recent alerts, newest first. |
@@ -114,7 +114,7 @@ of the file. Relative `database` and `file` notifier paths are resolved next to 
 | `match_threshold` | `0.80` | Minimum match score to accept a discovered page, and to keep it. |
 | `max_candidates_per_competitor` | `8` | Candidate pages checked per product and competitor during discovery. |
 | `base_currency` | `EUR` | Currency the rates are expressed in. |
-| `currency_rates` | `{}` | Units of `base_currency` per unit of another currency, e.g. `RON: "0.201"`. |
+| `currency_rates` | `{}` | Units of `base_currency` per unit of another currency, e.g. `RON: "0.201"`. Prices in a currency without a rate are left out of the market, and every scan reports it. |
 | `rediscover_after_hours` | `168` | Look for new or better pages after this long. |
 | `include_shipping` | `false` | Add competitor shipping to their price before comparing. |
 
@@ -132,7 +132,7 @@ of the file. Relative `database` and `file` notifier paths are resolved next to 
 | `currency` | Currency to assume when the page shows none, and what a symbol several currencies share means on this site (`$` in a CAD shop, `lei` in a Moldovan one). ISO codes on the page always win. |
 | `requests_per_minute` | Per-host pace (default 30). A robots.txt Crawl-delay can only lower it. |
 | `headers` | Extra request headers, e.g. `Accept-Language`. |
-| `enabled` | `false` skips the competitor without deleting it. |
+| `enabled` | `false` skips the competitor without deleting it. Its stored prices leave the market until it is enabled again; so do those of a competitor removed from the config. |
 
 **`selectors`** hold CSS selectors for `price`, `original_price`, `title`, `currency`,
 `availability`, `gtin`, `mpn`, `brand` and `shipping`. Set `price_attr` to read the price from
@@ -147,10 +147,10 @@ Any field you leave out is still taken from the other extraction layers.
 | `sku` | Your unique SKU. |
 | `name` | Product name, used for search queries and title matching. |
 | `brand`, `gtin`, `mpn` | Identifiers. A GTIN (EAN/UPC) makes matching exact, and an MPN nearly so. |
-| `our_price`, `cost`, `currency` | Your current price, your cost (used for the margin floor) and their currency (default `EUR`). |
+| `our_price`, `cost`, `currency` | Your current price, your cost (used for the margin floor) and their currency (default `EUR`; `eur`, `€` or `lei` are read as ISO codes). |
 | `keywords` | Extra search queries for discovery. |
 | `min_price`, `max_price` | Repricing bounds for this product. |
-| `competitor_urls` | Known pages, keyed by competitor name. Pinned pages always count as a match (score 1.0, reason `pinned`), and discovery is skipped for that competitor. |
+| `competitor_urls` | Known pages, keyed by competitor name. Pinned pages always count as a match (score 1.0, reason `pinned`), and they replace discovery and any listings it found for that competitor. A pinned URL that starts redirecting to another page (a delisted product sent to its category) must pass the matcher; otherwise the scan reports an error and reads no price. |
 
 Quote prices as strings (`"349.00"`) to keep them exact.
 
@@ -163,7 +163,7 @@ Quote prices as strings (`"349.00"`) to keep them exact.
 | `undercut_percent` | `null` | ...or by this percentage, which takes precedence when set (0 means match). |
 | `min_margin_percent` | `10` | Floor = cost × (1 + margin/100). The floor is also at least `min_price`. |
 | `ignore_out_of_stock` | `true` | Out-of-stock competitors do not count. |
-| `min_match_score` | `0.85` | Only offers matched at least this well are used for repricing. |
+| `min_match_score` | `0.85` | Only offers matched at least this well are used for repricing. Each competitor's best offer is chosen among those. |
 | `price_ending` | `null` | Make prices end in e.g. `0.99`, within the floor and ceiling. |
 
 ### `alerts[]`
@@ -206,7 +206,8 @@ Pinned `competitor_urls` replace discovery for that pair.
   matches the product.
 - Up to `max_candidates_per_competitor` candidates are fetched and scored. The best two at or
   above `match_threshold` become listings. Two are kept because shops sometimes list the same
-  item twice; any more would be noise.
+  item twice; any more would be noise. On rediscovery the current listings compete with the new
+  matches, so a better page replaces the weakest listing.
 
 **2. Extraction.** Each page is read through these layers, most trusted first:
 
@@ -261,7 +262,9 @@ the error `match lost`. A page answering 404/410 is deactivated, so the next sca
 
 **4. Storage.** Data lives in SQLite (WAL mode) in five tables: `runs`, `listings`, `discovery`,
 `observations` and `alerts`. Decimals are stored exactly. A failed fetch is stored as an
-observation with an `error`, so the market falls back to that listing's last good price.
+observation with an `error`, so the market falls back to that listing's last good reading, for
+up to 7 days of failures. An out-of-stock page that hides its price is a good reading: that
+listing leaves the market until it is back in stock.
 
 **5. Market and repricing.** PriceHunter takes the latest good reading of every active listing.
 It converts each price to the product's currency, adding shipping if configured, and keeps the
@@ -314,6 +317,9 @@ the new market with the market before this run. They are stored and then sent to
   WantedBy=timers.target
   ```
   Enable it with `systemctl enable --now pricehunter.timer`.
+
+Add `--strict` to have `scan` exit with code 3 when the run reported errors (pages that failed,
+notifiers that could not deliver, unknown SKUs), so systemd marks the run as failed.
 
 Daily or a few times a day is plenty for most markets.
 

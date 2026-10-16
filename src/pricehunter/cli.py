@@ -21,9 +21,10 @@ from rich.table import Table
 from rich.text import Text
 
 from . import __version__
+from .analyze import product_currency
 from .config import load_config
 from .demo import DemoMarket
-from .engine import build_snapshots, load_history, run_scan
+from .engine import build_snapshots, load_history, market_warnings, run_scan
 from .engine import probe as probe_page
 from .example_config import EXAMPLE_CONFIG
 from .models import (
@@ -60,6 +61,7 @@ ConfigOption = Annotated[
 ]
 SkuOption = Annotated[list[str] | None, typer.Option("--sku", help="Only this SKU (repeatable).")]
 REPORT_FORMATS = (".html", ".htm", ".csv", ".json")
+EXIT_SCAN_ERRORS = 3  # `scan --strict`: the run finished but reported errors
 _SPARK_BARS = "▁▂▃▄▅▆▇█"
 _INTERVAL = re.compile(r"(\d+(?:\.\d+)?)\s*([smhd])", re.IGNORECASE)
 _SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -194,12 +196,16 @@ def _stats_line(stats: ScanStats) -> Text:
     )
 
 
+def _print_problems(problems: list[str]) -> None:
+    for problem in problems:
+        console.print(Text(f"  ! {problem}", style="yellow"))
+
+
 def _print_result(config: AppConfig, result: ScanResult, *, table: bool = True) -> None:
     if table:
         console.print(_market_table(config, result.snapshots, result.suggestions))
     console.print(_stats_line(result.stats))
-    for error in result.errors[:10]:
-        console.print(Text(f"  ! {error}", style="yellow"))
+    _print_problems(result.errors[:10])
     if len(result.errors) > 10:
         console.print(Text(f"  ... and {len(result.errors) - 10} more", style="yellow"))
 
@@ -346,6 +352,13 @@ def scan(
         Path | None, typer.Option("--report", help="Also write a report: .html, .csv or .json.")
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Print every step.")] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict",
+            help=f"Exit with code {EXIT_SCAN_ERRORS} when the run reports errors (cron, systemd).",
+        ),
+    ] = False,
 ) -> None:
     """Discover competitor listings, read their prices, analyse and alert."""
     cfg = _load(config)
@@ -364,6 +377,8 @@ def scan(
         _print_result(cfg, result)
         if report is not None:
             _write_report(report, cfg, storage, result)
+    if strict and result.errors:
+        raise typer.Exit(EXIT_SCAN_ERRORS)
 
 
 @app.command()
@@ -408,10 +423,12 @@ def prices(config: ConfigOption = DEFAULT_CONFIG, sku: SkuOption = None) -> None
     _check_skus(cfg, sku)
     with Storage(cfg.settings.database) as storage:
         snapshots, suggestions = build_snapshots(cfg, storage, skus=sku)
-    if not any(s.offers for s in snapshots):
+        warnings = market_warnings(cfg, storage, skus=sku)
+    if not any(s.offers for s in snapshots) and not warnings:
         console.print("No competitor prices stored yet. Run: pricehunter scan")
         return
     console.print(_market_table(cfg, snapshots, suggestions))
+    _print_problems(warnings)
 
 
 @app.command()
@@ -421,6 +438,7 @@ def suggest(config: ConfigOption = DEFAULT_CONFIG, sku: SkuOption = None) -> Non
     _check_skus(cfg, sku)
     with Storage(cfg.settings.database) as storage:
         _, suggestions = build_snapshots(cfg, storage, skus=sku)
+        warnings = market_warnings(cfg, storage, skus=sku)
     table = Table(title=f"Repricing ({cfg.repricing.strategy})", show_lines=True)
     for name in ("Product", "Current", "Suggested", "Change", "Floor", "Ceiling", "Reason"):
         table.add_column(name, justify="left" if name in ("Product", "Reason") else "right")
@@ -428,7 +446,7 @@ def suggest(config: ConfigOption = DEFAULT_CONFIG, sku: SkuOption = None) -> Non
         product = cfg.product(s.sku)
         table.add_row(
             _two_lines(product.name if product else s.sku, s.sku, "bold"),
-            _money(s.current_price, product.currency if product else None),
+            _money(s.current_price, product_currency(product) if product else None),
             Text(_money(s.suggested_price), style="bold"),
             _percent(s.change_percent),
             _money(s.floor),
@@ -436,6 +454,7 @@ def suggest(config: ConfigOption = DEFAULT_CONFIG, sku: SkuOption = None) -> Non
             Text(s.reason),
         )
     console.print(table)
+    _print_problems(warnings)
 
 
 @app.command()

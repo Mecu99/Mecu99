@@ -6,15 +6,26 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator, Iterator
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 import pytest
 
 from pricehunter.demo import DemoMarket
-from pricehunter.engine import MATCH_LOST, NO_PRICE, build_snapshots, load_history, probe, run_scan
+from pricehunter.engine import (
+    FALLBACK_MAX_AGE,
+    MATCH_LOST,
+    NO_PRICE,
+    build_snapshots,
+    load_history,
+    market_warnings,
+    probe,
+    run_scan,
+)
 from pricehunter.fetch import Fetcher
 from pricehunter.models import (
     AlertRule,
@@ -28,6 +39,7 @@ from pricehunter.models import (
     Product,
     ScanResult,
     Settings,
+    utcnow,
 )
 from pricehunter.storage import Storage
 
@@ -476,15 +488,30 @@ async def test_probe_explains_a_single_page(market: DemoMarket, config: AppConfi
 # --------------------------------------------------------------------------- discovery guards
 
 
-def _product_page(title: str, price: str, currency: str, gtin: str | None = None) -> str:
+def _product_page(
+    title: str,
+    price: str | None,
+    currency: str = "EUR",
+    gtin: str | None = None,
+    *,
+    brand: str | None = None,
+    availability: str | None = None,
+) -> str:
+    offer: dict[str, object] = {"@type": "Offer"}
+    if price is not None:
+        offer |= {"price": price, "priceCurrency": currency}
+    if availability:
+        offer["availability"] = f"https://schema.org/{availability}"
     data: dict[str, object] = {
         "@context": "https://schema.org",
         "@type": "Product",
         "name": title,
-        "offers": {"@type": "Offer", "price": price, "priceCurrency": currency},
+        "offers": offer,
     }
     if gtin:
         data["gtin13"] = gtin
+    if brand:
+        data["brand"] = {"@type": "Brand", "name": brand}
     return (
         f'<html><head><script type="application/ld+json">{json.dumps(data)}</script></head>'
         f"<body><h1>{title}</h1></body></html>"
@@ -648,3 +675,278 @@ async def test_pinned_page_with_indistinguishable_variants_reports_why() -> None
     assert obs.price is None and obs.method == "ambiguous"
     assert obs.error is not None and obs.error.startswith("no price: variants at different prices")
     assert result.alerts == []
+
+
+# --------------------------------------------------------------------------- market upkeep
+
+SONY = Product(sku="XM5", name="Sony WH-1000XM5", brand="Sony", our_price=D("350"), cost=D("200"))
+SONY_URL = "https://shop.example/p/sony-wh-1000xm5"
+SONY_PAGE = _product_page("Sony WH-1000XM5", "329.00", brand="Sony")
+ALERT_TYPES = ("undercut", "price_drop", "out_of_stock", "back_in_stock", "new_lowest")
+
+
+def _shops(product: Product, *names: str, **settings: Any) -> AppConfig:
+    """Mocked shops at ``https://<name>.example`` selling a copy of ``product``."""
+    return AppConfig(
+        settings=Settings(database=":memory:", respect_robots=False, max_retries=0, **settings),
+        competitors=[
+            Competitor(
+                name=name,
+                base_url=f"https://{name.lower()}.example",
+                search_url="/search?q={query}",
+                requests_per_minute=0,
+            )
+            for name in names
+        ],
+        products=[product.model_copy(deep=True)],
+        alerts=[AlertRule(type=t) for t in ALERT_TYPES],
+    )
+
+
+def _pinned(url: str, competitor: str = "Shop") -> Product:
+    return SONY.model_copy(update={"competitor_urls": {competitor: [url]}})
+
+
+async def _scan_pages(
+    config: AppConfig,
+    storage: Storage,
+    pages: dict[str, str | int],
+    redirects: dict[str, str] | None = None,
+    **options: Any,
+) -> ScanResult:
+    """One scan in which ``pages`` maps a URL to its HTML or an HTTP status (others are 404)
+    and ``redirects`` maps a URL to where it now permanently redirects."""
+    moved = redirects or {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url in moved:
+            return httpx.Response(301, headers={"Location": moved[url]})
+        page = pages.get(url, 404)
+        return httpx.Response(page) if isinstance(page, int) else httpx.Response(200, html=page)
+
+    async with Fetcher(config.settings, transport=httpx.MockTransport(handle)) as fetcher:
+        return await run_scan(config, storage, fetcher=fetcher, **{"notify": False, **options})
+
+
+async def test_sold_out_page_hiding_its_price_leaves_the_market_and_alerts_once() -> None:
+    config = _shops(_pinned(SONY_URL), "Shop")
+    days = [
+        ("299.00", "InStock"),
+        (None, "OutOfStock"),
+        (None, "OutOfStock"),
+        ("299.00", "InStock"),
+    ]
+    seen = []
+    with Storage(":memory:") as storage:
+        for price, stock in days:
+            page = _product_page("Sony WH-1000XM5", price, brand="Sony", availability=stock)
+            result = await _scan_pages(config, storage, {SONY_URL: page})
+            offers = [o.price for o in result.snapshots[0].offers]
+            seen.append(
+                (offers, result.suggestions[0].suggested_price, {a.type for a in result.alerts})
+            )
+    assert seen == [
+        ([D("299.00")], D("298.99"), {"undercut"}),
+        ([], D("350"), {"out_of_stock"}),  # no repricing against an item nobody can buy
+        ([], D("350"), set()),  # not repeated
+        ([D("299.00")], D("298.99"), {"back_in_stock", "undercut"}),
+    ]
+
+
+async def test_disabled_or_removed_competitor_leaves_the_market() -> None:
+    a, b = "https://a.example/p/xm5", "https://b.example/p/xm5"
+    config = _shops(SONY.model_copy(update={"competitor_urls": {"A": [a], "B": [b]}}), "A", "B")
+    pages: dict[str, str | int] = {
+        a: _product_page("Sony WH-1000XM5", "330.00", brand="Sony"),
+        b: _product_page("Sony WH-1000XM5", "249.00", brand="Sony"),
+    }
+    with Storage(":memory:") as storage:
+        first = await _scan_pages(config, storage, pages)
+        assert [o.competitor for o in first.snapshots[0].offers] == ["B", "A"]
+
+        config.competitors[1].enabled = False
+        second = await _scan_pages(config, storage, pages)
+        assert [o.competitor for o in second.snapshots[0].offers] == ["A"]
+        assert second.suggestions[0].reason.startswith("beat lowest (A @ 330.00)")
+        assert second.alerts == []
+
+        config.competitors[1].enabled = True  # back: its stored prices count again
+        assert [o.competitor for o in build_snapshots(config, storage)[0][0].offers] == ["B", "A"]
+        config.competitors.pop()  # removed (or renamed) in the config
+        snapshots, suggestions = build_snapshots(config, storage)
+    assert [o.competitor for o in snapshots[0].offers] == ["A"]
+    assert suggestions[0].suggested_price == D("329.99")
+
+
+CATEGORY_PAGE = """<html><head><title>Headphones | Shop</title></head><body><h1>Headphones</h1>
+<div class="product-card"><a href="/p/jbl-tune-510">JBL Tune 510BT</a>
+<span class="price">39,99 &euro;</span></div>
+<div class="product-card"><a href="/p/sony-wh-ch520">Sony WH-CH520</a>
+<span class="price">49,99 &euro;</span></div></body></html>"""
+
+
+async def test_pinned_url_redirecting_elsewhere_must_still_show_the_product() -> None:
+    config = _shops(_pinned(SONY_URL), "Shop")
+    category = "https://shop.example/c/headphones"
+    moved = "https://shop.example/p/sony-wh-1000xm5-black-123"
+    with Storage(":memory:") as storage:
+        await _scan_pages(config, storage, {SONY_URL: SONY_PAGE})
+
+        # Delisted: the shop sends the product URL to its category page.
+        result = await _scan_pages(config, storage, {category: CATEGORY_PAGE}, {SONY_URL: category})
+        [obs] = result.observations
+        assert obs.error is not None
+        assert obs.error.startswith(f"pinned URL now redirects to {category} (match 0.")
+        assert result.errors == [f"Shop: XM5: {SONY_URL}: {obs.error}"]
+        assert result.stats.errors == 1 and result.alerts == []
+        assert [o.price for o in result.snapshots[0].offers] == [D("329.00")]  # last good one
+        assert [(x.url, x.pinned, x.active) for x in storage.listings(active_only=False)] == [
+            (SONY_URL, True, True)
+        ]
+
+        # Moved to a new address that still is the product: read as usual.
+        page = _product_page("Sony WH-1000XM5", "319.00", brand="Sony")
+        result = await _scan_pages(config, storage, {moved: page}, {SONY_URL: moved})
+    assert [(o.price, o.error, o.match_reason) for o in result.observations] == [
+        (D("319.00"), None, "pinned")
+    ]
+
+
+async def test_pinned_url_redirecting_to_its_own_canonical_spelling_stays_trusted() -> None:
+    pinned = "http://shop.example/P/Căști-Sony-XM5"
+    canonical = "https://shop.example/p/c%C4%83%C8%99ti-sony-xm5/"
+    config = _shops(_pinned(pinned), "Shop")
+    page = _product_page("Casti over-ear, negru", "329.00")  # the matcher alone would reject it
+    with Storage(":memory:") as storage:
+        result = await _scan_pages(
+            config, storage, {canonical: page}, {str(httpx.URL(pinned)): canonical}
+        )
+    assert [(o.price, o.error, o.match_reason) for o in result.observations] == [
+        (D("329.00"), None, "pinned")
+    ]
+
+
+async def test_pinned_url_replaces_the_listings_discovery_found() -> None:
+    wrong = "https://shop.example/p/sony-wh-1000xm5-refurb-123"
+    right = "https://shop.example/p/sony-wh-1000xm5-new-456"
+    pages: dict[str, str | int] = {
+        wrong: _product_page("Sony WH-1000XM5 Wireless Headphones", "199.00", brand="Sony"),
+        right: SONY_PAGE,
+    }
+    config = _shops(SONY, "Shop")
+    with Storage(":memory:") as storage:
+        storage.upsert_listing(
+            Listing(sku="XM5", competitor="Shop", url=wrong, match_score=0.9, match_reason="title")
+        )
+        storage.mark_discovered("XM5", "Shop")
+        await _scan_pages(config, storage, pages)  # reads the wrong page at 199.00
+
+        config.products[0].competitor_urls = {"Shop": [right]}
+        assert build_snapshots(config, storage)[0][0].offers == []  # only pins count already
+        result = await _scan_pages(config, storage, pages)
+        assert [(x.url, x.pinned) for x in storage.listings()] == [(right, True)]
+    assert [o.url for o in result.observations] == [right]
+    assert [o.price for o in result.snapshots[0].offers] == [D("329.00")]
+
+
+S24_GTIN = "8806095299853"
+S24 = Product(
+    sku="S24", name="Samsung Galaxy S24 128GB Onyx Black", brand="Samsung", gtin=S24_GTIN,
+    our_price=D("819"),
+)  # fmt: skip
+S24_WEAK = {  # title-only listings a past discovery kept: no storage size on either page
+    "https://shop.example/p/galaxy-s24-5g-dual-sim-1": (
+        "Samsung Galaxy S24 5G Dual SIM Onyx Black",
+        "699.00",
+        0.845,
+    ),
+    "https://shop.example/p/galaxy-s24-onyx-2": ("Samsung Galaxy S24 Onyx Black", "719.00", 0.93),
+}
+
+
+@pytest.mark.parametrize(
+    ("gtin", "kept"),
+    [
+        (S24_GTIN, ["better-3"]),  # an identifier match leaves no room for look-alikes
+        (None, ["better-3", "galaxy-s24-onyx-2"]),  # a better title match ousts the weakest
+    ],
+)
+async def test_rediscovery_replaces_weaker_listings(gtin: str | None, kept: list[str]) -> None:
+    better = "https://shop.example/p/better-3"
+    pages: dict[str, str | int] = {
+        url: _product_page(title, price, brand="Samsung")
+        for url, (title, price, _) in S24_WEAK.items()
+    }
+    pages[better] = _product_page(
+        "Samsung Galaxy S24 128GB Black", "799.00", gtin=gtin, brand="Samsung"
+    )
+    pages[f"https://shop.example/search?q={S24_GTIN}"] = f'<a href="{better}">S24</a>'
+    config = _shops(S24, "Shop", rediscover_after_hours=1)
+    with Storage(":memory:") as storage:
+        for url, (_, _, score) in S24_WEAK.items():
+            storage.upsert_listing(
+                Listing(
+                    sku="S24", competitor="Shop", url=url, match_score=score, match_reason="title"
+                )
+            )
+        storage.mark_discovered("S24", "Shop", utcnow() - timedelta(hours=5))
+        result = await _scan_pages(config, storage, pages)
+        listed = [urlsplit(x.url).path.removeprefix("/p/") for x in storage.listings()]
+    assert listed == kept and result.stats.listings_matched == 1
+    assert sorted(urlsplit(o.url).path.removeprefix("/p/") for o in result.observations) == sorted(
+        kept
+    )
+    assert result.snapshots[0].lowest == (D("799.00") if gtin else D("719.00"))
+
+
+@pytest.mark.parametrize(
+    ("age", "offers"),
+    [
+        (FALLBACK_MAX_AGE - timedelta(days=1), [D("249.00")]),
+        (FALLBACK_MAX_AGE + timedelta(days=1), []),
+    ],
+)
+async def test_last_good_price_stands_in_for_a_failing_page_for_a_limited_time(
+    age: timedelta, offers: list[Decimal]
+) -> None:
+    config = _shops(_pinned(SONY_URL), "Shop")
+    with Storage(":memory:") as storage:
+        storage.add_observation(
+            Observation(
+                sku="XM5", competitor="Shop", url=SONY_URL, price=D("249.00"), currency="EUR",
+                match_score=1.0, match_reason="pinned", observed_at=utcnow() - age,
+            )
+        )  # fmt: skip
+        result = await _scan_pages(config, storage, {SONY_URL: 403})
+    assert [o.error for o in result.observations] == ["HTTP 403"]
+    assert [o.price for o in result.snapshots[0].offers] == offers
+
+
+async def test_prices_in_a_currency_without_a_rate_are_reported() -> None:
+    url = "https://pl.example/p/xm5"
+    config = _shops(_pinned(url, "PL"), "PL", currency_rates={"RON": D("0.201")})
+    page = _product_page("Sony WH-1000XM5", "999.00", "PLN", brand="Sony")
+    with Storage(":memory:") as storage:
+        result = await _scan_pages(config, storage, {url: page})
+        warnings = market_warnings(config, storage)
+    expected = (
+        "no currency rate for PLN in settings.currency_rates:"
+        " prices from PL are left out of the market"
+    )
+    assert result.errors == warnings == [expected]
+    assert result.stats.errors == 1 and result.snapshots[0].offers == []
+
+
+async def test_run_stats_count_every_reported_error(tmp_path: Path) -> None:
+    config = _shops(_pinned(SONY_URL), "Shop")
+    config.notifiers = [NotifierConfig(type="file", path=str(tmp_path))]  # a directory: fails
+    with Storage(":memory:") as storage:
+        result = await _scan_pages(
+            config, storage, {SONY_URL: SONY_PAGE}, skus=["XM5", "TYPO"], notify=True
+        )
+        stored = storage.runs()[0]
+    assert result.alerts and len(result.errors) == 2
+    assert result.errors[0] == "unknown SKU 'TYPO'"
+    assert result.errors[1].startswith("file notifier failed: IsADirectoryError")
+    assert result.stats.errors == stored.errors == 2

@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from pricehunter.analyze import market_snapshot, suggest_price
+from pricehunter.analyze import market_snapshot, missing_rates, reprice, suggest_price
 from pricehunter.models import (
     Availability,
     CompetitorPrice,
@@ -173,6 +173,32 @@ def test_snapshot_skips_unconvertible_and_assumes_missing_currency() -> None:
     assert [(o.competitor, o.price, o.original_currency) for o in snap.offers] == [
         ("n", D("12.00"), None)
     ]
+
+
+@pytest.mark.parametrize(("spelling", "iso"), [("eur", "EUR"), ("€", "EUR"), ("lei", "RON")])
+def test_product_currency_spellings_are_normalised(spelling: str, iso: str) -> None:
+    readings = [obs("eu", "100.00"), obs("ro", "500.00", currency="RON")]
+    snap = market_snapshot(product(currency=spelling), readings, SETTINGS)
+    assert snap.currency == iso
+    price = {"EUR": "100.00", "RON": "500.00"}[iso]  # 500 RON * 0.2 = 100 EUR
+    assert [f"{o.competitor}:{o.price}" for o in snap.offers] == [f"eu:{price}", f"ro:{price}"]
+
+
+def test_missing_rates_name_each_currency_and_who_it_leaves_out() -> None:
+    readings = [
+        obs("pl", "999.00", currency="PLN"),
+        obs("pl2", "899.00", currency="pln"),
+        obs("ro", "500.00", currency="RON"),  # has a rate
+        obs("n", "90.00", currency=None),  # taken as the product's currency
+        obs("gone", None, currency="GBP", availability=OUT),  # no price, nothing to convert
+        obs("other", "9.00", currency="CHF", sku="OTHER"),
+    ]
+    assert missing_rates(product(), readings, SETTINGS) == {"PLN": {"pl", "pl2"}}
+    # Our own currency can be the one without a rate.
+    assert missing_rates(product(currency="CHF"), [obs("eu", "100.00")], SETTINGS) == {
+        "CHF": {"eu"}
+    }
+    assert missing_rates(product(), [obs("eu", "100.00")], SETTINGS) == {}
 
 
 @pytest.mark.parametrize(
@@ -464,6 +490,21 @@ def test_match_score_filter_in_suggestion() -> None:
         RepricingRule(strategy="match_lowest", min_match_score=0.5),
     )
     assert loose.suggested_price == D("50.00")
+
+
+def test_reprice_picks_each_competitors_offer_among_trusted_listings() -> None:
+    """A competitor's cheaper but doubtful listing must not hide its confident one."""
+    p = product(our_price=D("150"), cost=D("50"))
+    readings = [
+        obs("shop", "100.00", score=0.82, url="https://shop.example/a"),
+        obs("shop", "120.00", score=0.95, url="https://shop.example/b"),
+    ]
+    rule = RepricingRule()  # min_match_score 0.85
+    assert market_snapshot(p, readings, SETTINGS, 0.8).lowest == D("100.00")
+    s = reprice(p, readings, SETTINGS, rule, min_match_score=0.8)
+    assert s.suggested_price == D("119.99") and s.reason.startswith("beat lowest (shop @ 120.00)")
+    # The caller's own threshold applies when it is the stricter one.
+    assert reprice(p, readings, SETTINGS, rule, min_match_score=0.99).reason == "no competitor data"
 
 
 def test_end_to_end_multi_currency() -> None:

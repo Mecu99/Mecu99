@@ -201,6 +201,35 @@ def test_suggest_explains_each_price(runner: CliRunner, demo_env: DemoEnv) -> No
     assert "298.99" in result.output and "beat lowest (MegaShop @ 299.99)" in result.output
 
 
+def test_prices_and_suggest_name_currencies_without_a_rate(
+    runner: CliRunner, demo_env: DemoEnv, tmp_path: Path
+) -> None:
+    cfg = load_config(demo_env.config)
+    cfg.settings.currency_rates = {}  # PretMic quotes RON
+    path = write_config(cfg, tmp_path / "no-rates.yaml")
+    for command in ("prices", "suggest"):
+        result = runner.invoke(app, [command, "-c", str(path)])
+        assert result.exit_code == 0, result.output
+        assert "no currency rate for RON" in result.output
+        assert "prices from PretMic are left out" in result.output
+    clean = runner.invoke(app, ["prices", "-c", str(demo_env.config)])
+    assert "no currency rate" not in clean.output
+
+
+def test_scan_strict_exits_non_zero_when_the_run_reports_errors(
+    runner: CliRunner, demo_env: DemoEnv, tmp_path: Path
+) -> None:
+    cfg = load_config(demo_env.config)
+    cfg.settings.database = str(tmp_path / "strict.db")
+    path = write_config(cfg, tmp_path / "strict.yaml")
+    args = ["scan", "-c", str(path), "--sku", "NOPE", "--no-discover", "--no-notify"]
+    lenient = runner.invoke(app, args)
+    assert lenient.exit_code == 0, lenient.output
+    assert "1 errors" in lenient.output and "unknown SKU 'NOPE'" in lenient.output
+    strict = runner.invoke(app, [*args, "--strict"])
+    assert strict.exit_code == 3 and "unknown SKU 'NOPE'" in strict.output
+
+
 def test_history_lists_readings_with_sparklines(runner: CliRunner, demo_env: DemoEnv) -> None:
     result = runner.invoke(app, ["history", "SONY-XM5", "-c", str(demo_env.config)])
     assert result.exit_code == 0, result.output

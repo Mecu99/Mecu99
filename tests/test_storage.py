@@ -337,6 +337,56 @@ def test_previous_observation(db: Storage) -> None:
     assert db.previous_observation("SKU1", "shopB", url, current) is None
 
 
+def test_out_of_stock_reading_without_a_price_is_the_current_state(db: Storage) -> None:
+    """Shops often hide the price once an item sells out: that reading must not fall back."""
+    url = "https://a.example/p1"
+    db.add_observation(obs(price="299.00", minutes=0))
+    sold_out = obs(price=None, minutes=60).model_copy(
+        update={"availability": Availability.OUT_OF_STOCK}
+    )
+    sold_out_id = db.add_observation(sold_out)
+
+    (latest,) = db.latest_observations()
+    assert latest.id == sold_out_id and latest.price is None  # not the old 299.00
+
+    restocked = db.add_observation(obs(price="299.00", minutes=120))
+    prev = db.previous_observation("SKU1", "shopA", url, restocked)
+    assert prev is not None and prev.id == sold_out_id
+    assert [o.price for o in db.history("SKU1")] == [D("299.00"), D("299.00")]  # priced only
+
+
+def test_fallback_to_the_last_good_reading_is_bounded(db: Storage) -> None:
+    r1, r2, r3 = db.start_run(), db.start_run(), db.start_run()
+    day = 24 * 60
+    db.add_observations(
+        [
+            obs(run_id=r1, price="249.00", minutes=0),
+            obs(run_id=r2, price=None, error="HTTP 403", minutes=3 * day),
+            obs(run_id=r3, price=None, error="HTTP 403", minutes=10 * day),
+        ]
+    )
+    week = timedelta(days=7)
+    assert db.latest_observations(max_fallback_age=week) == []  # failing for 10 days
+    assert [o.price for o in db.latest_observations(max_fallback_age=timedelta(days=11))] == [
+        D("249.00")
+    ]
+    # The market as run 3 saw it: failing for 3 days only.
+    previous = db.latest_observations(before_run=r3, max_fallback_age=week)
+    assert [o.price for o in previous] == [D("249.00")]
+    # A good reading, however old, is never dropped when it is the latest attempt.
+    db.add_observation(obs(price="239.00", minutes=11 * day))
+    assert [o.price for o in db.latest_observations(max_fallback_age=week)] == [D("239.00")]
+
+
+def test_database_path_expands_the_home_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with Storage("~/data/ph.db") as storage:
+        storage.start_run()
+    assert (tmp_path / "data" / "ph.db").is_file()
+
+
 def test_history_filters_and_order(db: Storage) -> None:
     db.add_observations(
         [
