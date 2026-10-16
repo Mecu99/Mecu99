@@ -1,19 +1,23 @@
-"""End-to-end tests of the scan engine against the local demo marketplace."""
+"""End-to-end tests of the scan engine against the local demo marketplace (and, for the
+discovery guards, a mocked shop)."""
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
 
 from pricehunter.demo import DemoMarket
 from pricehunter.engine import MATCH_LOST, NO_PRICE, build_snapshots, load_history, probe, run_scan
 from pricehunter.fetch import Fetcher
 from pricehunter.models import (
+    AlertRule,
     AppConfig,
     Availability,
     Competitor,
@@ -21,7 +25,9 @@ from pricehunter.models import (
     Listing,
     NotifierConfig,
     Observation,
+    Product,
     ScanResult,
+    Settings,
 )
 from pricehunter.storage import Storage
 
@@ -465,3 +471,98 @@ async def test_probe_explains_a_single_page(market: DemoMarket, config: AppConfi
 
     missing, empty, nothing = await probe(url + "-missing", pretmic, config.settings, sony)
     assert (missing.status, missing.error, empty.price, nothing) == (404, "HTTP 404", None, None)
+
+
+# --------------------------------------------------------------------------- discovery guards
+
+
+def _product_page(title: str, price: str, currency: str, gtin: str | None = None) -> str:
+    data: dict[str, object] = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": title,
+        "offers": {"@type": "Offer", "price": price, "priceCurrency": currency},
+    }
+    if gtin:
+        data["gtin13"] = gtin
+    return (
+        f'<html><head><script type="application/ld+json">{json.dumps(data)}</script></head>'
+        f"<body><h1>{title}</h1></body></html>"
+    )
+
+
+async def _scan_search_shop(
+    product: Product, pages: dict[str, str]
+) -> tuple[ScanResult, list[Listing]]:
+    """One scan of a shop whose site search lists every page in ``pages`` (path -> HTML)."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            cards = "".join(f'<div class="product-card"><a href="{p}">x</a></div>' for p in pages)
+            return httpx.Response(200, html=f"<html><body><main>{cards}</main></body></html>")
+        if request.url.path in pages:
+            return httpx.Response(200, html=pages[request.url.path])
+        return httpx.Response(404)
+
+    config = AppConfig(
+        settings=Settings(database=":memory:", respect_robots=False, max_retries=0),
+        competitors=[
+            Competitor(
+                name="Shop",
+                base_url="https://shop.example",
+                search_url="/search?q={query}",
+                requests_per_minute=0,
+            )
+        ],
+        products=[product],
+        alerts=[AlertRule(type="undercut")],
+    )
+    with Storage(":memory:") as storage:
+        async with Fetcher(config.settings, transport=httpx.MockTransport(handle)) as fetcher:
+            result = await run_scan(config, storage, fetcher=fetcher, notify=False)
+        return result, storage.listings()
+
+
+async def test_identifier_match_keeps_title_only_lookalikes_out() -> None:
+    gtin = "8806095299853"
+    s24 = Product(
+        sku="S24", name="Samsung Galaxy S24 128GB Onyx Black", brand="Samsung", gtin=gtin,
+        our_price=D("819"), currency="EUR",
+    )  # fmt: skip
+    pages = {
+        "/samsung-galaxy-s24-128gb-onyx-black-p-1001.html": _product_page(
+            "Samsung Galaxy S24 128GB Onyx Black", "799.00", "EUR", gtin=gtin
+        ),
+        # Accepted on its title alone, but the GTIN page already is the exact item.
+        "/samsung-galaxy-s24-128gb-onyx-black-dual-sim-p-1002.html": _product_page(
+            "Samsung Galaxy S24 128GB Onyx Black Dual SIM", "549.00", "EUR"
+        ),
+    }
+    result, listings = await _scan_search_shop(s24, pages)
+
+    assert [(urlsplit(x.url).path, x.match_reason) for x in listings] == [
+        ("/samsung-galaxy-s24-128gb-onyx-black-p-1001.html", "gtin")
+    ]
+    assert result.snapshots[0].lowest == D("799.00")
+
+
+async def test_implausibly_cheap_title_match_is_not_listed() -> None:
+    xm5 = Product(
+        sku="XM5", name="Sony WH-1000XM5", brand="Sony", our_price=D("1549.99"), currency="RON"
+    )
+    pages = {
+        "/casti-sony-wh-1000xm5-negru-p-1001.html": _product_page(
+            "Casti wireless Sony WH-1000XM5, Noise Cancelling, Negru", "1499.99", "RON"
+        ),
+        # Czech ear pads: no keyword the matcher knows, but 94% under our price.
+        "/nausniky-sony-wh-1000xm5-p-1002.html": _product_page(
+            "Náušníky Sony WH-1000XM5", "89.99", "RON"
+        ),
+    }
+    result, listings = await _scan_search_shop(xm5, pages)
+
+    assert [urlsplit(x.url).path for x in listings] == [
+        "/casti-sony-wh-1000xm5-negru-p-1001.html"
+    ]
+    assert result.snapshots[0].lowest == D("1499.99")
+    assert [a.new_price for a in result.alerts] == [D("1499.99")]

@@ -21,8 +21,10 @@ self-contained demo you can run offline in a few seconds.
   prices, shipping, GTIN, MPN and brand are read too.
 - **Careful matching.** Matching by GTIN or MPN is exact. Otherwise a fuzzy title score is
   combined with guards against wrong variants: storage, size and pack-count conflicts,
-  different model numbers (XM4 vs XM5, iPhone 14 vs 15), Pro/Max/Plus siblings, accessories,
-  and refurbished or used items.
+  different model numbers and generations (XM4 vs XM5, MX Master 3 vs 3S, Series X vs S,
+  AirPods 1st vs 2nd generation, Mark II), Pro/Max/Plus/OLED and Wi-Fi/cellular siblings,
+  bundles, accessories and spare parts, and refurbished, used, open-box or demo items, with
+  keywords for English, Romanian, German, French, Spanish, Italian and Polish shop titles.
 - **History.** Every reading is stored in SQLite, so you can see trends, sparklines and which
   listing was read when.
 - **Market position.** For each product you get the lowest, median, average and highest
@@ -233,11 +235,19 @@ Otherwise a blend of fuzzy title ratios is adjusted:
 | Adjustment | Effect |
 |---|---|
 | Missing brand | × 0.75 |
-| Accessory or condition words that only the competitor's title has | × 0.6 |
-| Pro/Max/Plus/Mini mismatch | × 0.7 |
-| Model number conflict | capped at 0.45 |
+| Accessory or spare-part words that only the competitor's title has (or a part noun such as "Akku" or "Filtru" leading it) | × 0.6 |
+| Bundle signs that only the competitor's title has ("+ 2 games", "Kit", "Pachet") | × 0.6 |
+| Used, refurbished, open-box or demo condition that only the competitor's title has | × 0.6 |
+| Pro/Max/Plus/Mini/OLED/Edition/Mark or Wi-Fi vs cellular mismatch, unless both titles carry the same full model code | × 0.7 |
+| The same full model code on both sides (e.g. `WAN28263BY`) and nothing else against it | at least 0.90 |
+| Model number or generation conflict (3 vs 3S, Series X vs S, 1st vs 2nd generation) | capped at 0.45 |
 | Spec conflict (128GB vs 256GB, 6-pack vs single) | capped at 0.40 |
 | MPN conflict | capped at 0.30 |
+
+Model codes a shop writes with spaces (`QE 55Q80C`, `WH 1000 XM5`) are compared as one code.
+Discovery keeps at most two listings per product and competitor. Once a GTIN or MPN match is
+found there, title-only look-alikes are not kept next to it. A new title-only match priced
+under 40% of your price is skipped as a likely accessory or spare part.
 
 Every scan re-scores the listings. A page that stops matching is deactivated and recorded with
 the error `match lost`. A page answering 404/410 is deactivated, so the next scan rediscovers.

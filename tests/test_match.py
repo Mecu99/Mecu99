@@ -415,6 +415,269 @@ def test_fashion_matching() -> None:
     assert score_match(jeans, offer("Blugi Levi's 505 Regular Fit barbati")).score < THRESHOLD
 
 
+# --------------------------------------------------------------------------- generations
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Apple AirPods Pro (2nd generation)", "apple airpods pro 2"),
+        ("AirPods Pro 2. Generation", "airpods pro 2"),
+        ("AirPods Pro 2e génération", "airpods pro 2"),
+        ("AirPods Pro generatia a 2-a", "airpods pro 2"),
+        ("Canon EOS R6 Mark II", "canon eos r6 mark 2"),
+        ("Canon EOS R6 MkII", "canon eos r6 mark 2"),
+        ("Sony Alpha A7 IV", "sony alpha a7 4"),
+        ("LEGO Technic 42143, 18+", "lego technic 42143 18"),
+        ("Joc Monopoly 8+ ani", "joc monopoly 8 ani"),
+        ("LEGO Icons, Ages 18+", "lego icons ages 18"),
+        ("Samsung Galaxy Note 10+", "samsung galaxy note 10 plus"),
+        ("Bosch WAN28263BY 1400 RPM", "bosch wan28263by 1400rpm"),
+        ("garantie 24 luni", "garantie 24mo"),
+        ("Szkło hartowane", "szklo hartowane"),
+    ],
+)
+def test_normalize_text_generations_ages_and_counts(raw: str, expected: str) -> None:
+    assert normalize_text(raw) == expected
+
+
+def test_bottles_and_cans_are_pack_counts() -> None:
+    assert spec_tokens("Coca-Cola bax 12 sticle 0.5L") == {"pcs": {"12"}, "l": {"0.5"}}
+    assert spec_tokens("Bere Ursus 6 doze 0.5L") == {"pcs": {"6"}, "l": {"0.5"}}
+
+
+# --------------------------------------------------------------------------- used and refurbished
+
+
+S24 = Product(sku="S24", name="Samsung Galaxy S24 128GB Onyx Black", brand="Samsung")
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "- Pre-owned", "- Grade A", "Grad B", "Demo unit", "- Ex-display", "(Reconditioned)",
+        "- Like New", "Open Box", "B-Stock", "Second-hand",
+        "Gebraucht", "Generalüberholt", "B-Ware", "wie neu",  # DE
+        "Reconditionné", "Remis à neuf", "d'occasion",  # FR
+        "Reacondicionado", "Seminuevo", "Usado",  # ES
+        "Ricondizionato", "Usato", "Rigenerato",  # IT
+        "odnowiony", "używany", "powystawowy",  # PL
+        "Folosit", "Ca Nou", "(Reînnoit)", "Resigilat", "Recondiționat",  # RO
+    ],
+)  # fmt: skip
+def test_used_refurbished_and_demo_items_rejected(condition: str) -> None:
+    result = score_match(S24, offer(f"Samsung Galaxy S24 128GB Onyx Black {condition}"))
+    assert result.score < THRESHOLD, result
+    assert result.details["condition_penalty"] == 0.6
+
+
+def test_refurbished_product_of_ours_matches_refurbished_offers() -> None:
+    ours = S24.model_copy(update={"name": "Samsung Galaxy S24 128GB Onyx Black Refurbished"})
+    result = score_match(ours, offer("Samsung Galaxy S24 128GB Onyx Black - Renewed"))
+    assert "condition_penalty" not in result.details
+    assert result.score >= THRESHOLD
+
+
+# --------------------------------------------------------------------------- accessories and spare parts
+
+XM5 = Product(sku="XM5", name="Sony WH-1000XM5", brand="Sony")
+V15 = Product(sku="V15", name="Dyson V15 Detect Absolute", brand="Dyson")
+AIRPODS = Product(sku="APP2", name="Apple AirPods Pro 2", brand="Apple")
+
+
+@pytest.mark.parametrize(
+    ("product", "title"),
+    [
+        (XM5, "Etui Sony WH-1000XM5"),
+        (XM5, "Hülle für Sony WH-1000XM5"),
+        (XM5, "Pernute Sony WH-1000XM5"),
+        (XM5, "Ohrpolster Sony WH-1000XM5"),
+        (XM5, "Sony WH-1000XM5 Ersatzpolster"),
+        (XM5, "Geanta transport Sony WH-1000XM5"),
+        (AIRPODS, "Coque Apple AirPods Pro 2"),
+        (AIRPODS, "Ear tips Apple AirPods Pro 2"),
+        (AIRPODS, "Charging Case for Apple AirPods Pro 2"),
+        (V15, "Filtru Dyson V15 Detect Absolute"),
+        (V15, "Acumulator Dyson V15 Detect Absolute"),
+        (V15, "Akku Dyson V15 Detect Absolute"),
+        (V15, "Perie Dyson V15 Detect Absolute"),
+        (V15, "Dyson V15 Detect Absolute Replacement Battery"),
+        (IPHONE, "Szkło hartowane do Apple iPhone 15"),
+        (IPHONE, "Ładowarka do Apple iPhone 15"),
+        (IPHONE, "Funda Apple iPhone 15 128GB negro"),
+    ],
+)
+def test_multilingual_accessories_and_spare_parts_rejected(product: Product, title: str) -> None:
+    result = score_match(product, offer(title))
+    assert result.score < THRESHOLD, result
+    assert result.details["accessory_penalty"] == 0.6
+
+
+@pytest.mark.parametrize(
+    ("product", "title"),
+    [
+        # Part words further into the title describe the product itself.
+        (V15, "Aspirator vertical fara fir Dyson V15 Detect Absolute, acumulator, 60 min autonomie"),
+        (V15, "Dyson V15 Detect Absolute Cordless Vacuum, HEPA filter, 60 min battery"),
+        (XM5, "Sony WH-1000XM5 Wireless Headphones, 30 Hours Battery, Black"),
+        (XM5, "Sony WH-1000XM5 Kabellose Bluetooth Noise Cancelling Kopfhörer, schwarz"),
+        (AIRPODS, "Apple AirPods Pro (2nd generation) with MagSafe Charging Case (USB-C)"),
+        (
+            Product(sku="W9", name="Apple Watch Series 9 GPS 41mm", brand="Apple"),
+            "Apple Watch Series 9 GPS 41mm Midnight Aluminium Case with Midnight Sport Band",
+        ),
+        (
+            Product(sku="PS5", name="Sony PlayStation 5 Slim", brand="Sony"),
+            "Consola de jocuri Sony PlayStation 5 Slim, 1TB SSD",
+        ),
+    ],
+)
+def test_part_words_that_do_not_lead_the_title_are_specs(product: Product, title: str) -> None:
+    result = score_match(product, offer(title))
+    assert "accessory_penalty" not in result.details
+    assert result.score >= THRESHOLD, result
+
+
+def test_part_word_leading_our_own_name_is_not_penalised() -> None:
+    brita = Product(sku="BRITA", name="Filtru Brita Maxtra Plus", brand="Brita")
+    result = score_match(brita, offer("Filtru de apa Brita Maxtra Plus"))
+    assert "accessory_penalty" not in result.details
+    assert result.score >= THRESHOLD
+
+
+# --------------------------------------------------------------------------- sibling models
+
+
+@pytest.mark.parametrize(
+    ("ours", "brand", "theirs"),
+    [
+        ("Microsoft Xbox Series X", "Microsoft", "Microsoft Xbox Series S"),
+        ("Logitech MX Master 3S", "Logitech", "Logitech MX Master 3"),
+        ("Logitech MX Master 3", "Logitech", "Logitech MX Master 3S"),
+        ("Garmin Fenix 7", "Garmin", "Garmin Fenix 7X Solar"),
+        ("Google Pixel 8 128GB", "Google", "Google Pixel 8a 128GB"),
+        ("Xiaomi 14 512GB", "Xiaomi", "Xiaomi 14T 512GB"),
+        ("Apple AirPods Pro (2nd generation)", "Apple", "Apple AirPods Pro (1st generation)"),
+        ("Apple AirPods Pro 2", "Apple", "Apple AirPods Pro (1st generation)"),
+        ("Sony Alpha A7 IV Body", "Sony", "Sony Alpha A7 III Body"),
+        ("Canon EOS 5D Mark IV", "Canon", "Canon EOS 5D Mark III"),
+    ],
+)
+def test_sibling_model_numbers_and_generations_conflict(ours: str, brand: str, theirs: str) -> None:
+    result = score_match(Product(sku="x", name=ours, brand=brand), offer(theirs))
+    assert result.reason == "model_conflict", result
+    assert result.score <= 0.45
+
+
+@pytest.mark.parametrize(
+    ("ours", "brand", "theirs"),
+    [
+        ("Nintendo Switch OLED", "Nintendo", "Nintendo Switch"),
+        ("Nintendo Switch", "Nintendo", "Nintendo Switch OLED"),
+        ("Sony PlayStation 5 Console", "Sony", "Sony PlayStation 5 Digital Edition Console"),
+        ("Canon EOS R6 Mark II", "Canon", "Canon EOS R6"),
+        ("Apple Watch Series 9 GPS 41mm", "Apple", "Apple Watch Series 9 GPS + Cellular 41mm"),
+        ("Apple iPad Air 11 M2 Wi-Fi 128GB", "Apple", "Apple iPad Air 11 M2 Wi-Fi + Cellular 128GB"),
+        ("Samsung Galaxy Tab S9 WiFi 128GB", "Samsung", "Samsung Galaxy Tab S9 5G 128GB"),
+        ("GoPro HERO12 Black", "GoPro", "GoPro HERO12 Black Creator Edition"),
+    ],
+)
+def test_edition_and_connectivity_siblings_rejected(ours: str, brand: str, theirs: str) -> None:
+    result = score_match(Product(sku="x", name=ours, brand=brand), offer(theirs))
+    assert result.score < THRESHOLD, result
+    assert result.details["variant_penalty"] == 0.7
+
+
+@pytest.mark.parametrize(
+    ("ours", "brand", "theirs"),
+    [
+        ("Apple AirPods Pro 2", "Apple", "Apple AirPods Pro (2nd generation)"),
+        ("Canon EOS R6 Mark II Body", "Canon", "Canon EOS R6 MkII Body"),
+        ("Logitech MX Master 3S", "Logitech", "Mouse Logitech MX Master 3S, Wireless, Graphite"),
+        ("Garmin Fenix 7X Solar", "Garmin", "Ceas smartwatch Garmin Fenix 7X Solar, 51mm, Slate Gray"),
+        ("Microsoft Xbox Series X", "Microsoft", "Consola Microsoft Xbox Series X 1TB, Negru"),
+        ("Samsung Galaxy Note 10+ 256GB", "Samsung", "Samsung Galaxy Note10+ 256GB Aura Glow"),
+        ("Samsung Galaxy Tab S9 5G 128GB", "Samsung", "Tableta Samsung Galaxy Tab S9, 128GB, 8GB RAM, 5G"),
+        ("TP-Link Archer C6 WiFi Router", "TP-Link", "Router TP-Link Archer C6, Dual Band 2.4G/5G WiFi"),
+        # The exact model code outweighs how a shop words the variant.
+        ("Samsung QE55S95C", "Samsung", "Televizor Samsung OLED QE55S95C, 138 cm, Smart, 4K"),
+        ("Samsung Galaxy S24 Ultra SM-S928B 256GB", "Samsung", "Samsung Galaxy S24 SM-S928B 256GB Titanium"),
+    ],
+)
+def test_same_model_in_other_words_accepted(ours: str, brand: str, theirs: str) -> None:
+    result = score_match(Product(sku="x", name=ours, brand=brand), offer(theirs))
+    assert result.score >= THRESHOLD, result
+
+
+# --------------------------------------------------------------------------- bundles
+
+
+PS5 = Product(sku="PS5", name="Sony PlayStation 5 Slim", brand="Sony")
+R6_BODY = Product(sku="R6", name="Canon EOS R6 Mark II Body", brand="Canon")
+
+
+@pytest.mark.parametrize(
+    ("product", "title"),
+    [
+        (PS5, "Consola Sony PlayStation 5 Slim + 2 jocuri"),
+        (PS5, "Pachet Consola Sony PlayStation 5 Slim cu controller suplimentar"),
+        (PS5, "Sony PlayStation 5 Slim + EA Sports FC 25 Bundle"),
+        (R6_BODY, "Canon EOS R6 Mark II Kit RF 24-105mm"),
+        (R6_BODY, "Canon EOS R6 Mark II + RF 24-105mm"),
+    ],
+)
+def test_bundles_rejected(product: Product, title: str) -> None:
+    result = score_match(product, offer(title))
+    assert result.score < THRESHOLD, result
+    assert result.details["bundle_penalty"] == 0.6
+
+
+@pytest.mark.parametrize(
+    ("product", "title", "accepted"),
+    [
+        (COLA.model_copy(update={"name": "Coca-Cola Zero 0.5L"}), "Coca-Cola Zero bax 12 sticle 0.5L", False),
+        (COLA, "Pachet 6 sticle Coca-Cola Zero 0.5L", True),  # our own 6-pack
+        (Product(sku="KK", name="KitKat Chunky 40g", brand="Nestle"), "Nestle Kit Kat Chunky 40g", True),
+        (Product(sku="TVB", name="Xiaomi Mi TV Box S", brand="Xiaomi"), "Set-top box Xiaomi Mi TV Box S", True),
+    ],
+)
+def test_pack_words_against_pack_sizes(product: Product, title: str, accepted: bool) -> None:
+    assert (score_match(product, offer(title)).score >= THRESHOLD) is accepted
+
+
+# --------------------------------------------------------------------------- spaced codes
+
+
+@pytest.mark.parametrize(
+    ("ours", "brand", "theirs"),
+    [
+        ("Samsung QE55Q80C", "Samsung", "Televizor Samsung QE 55Q80C, 138 cm, QLED"),
+        ("LG OLED55C3", "LG", "Televizor LG OLED 55C3, 139 cm, 4K"),
+        ("Sony WH-1000XM5", "Sony", "Sony WH 1000 XM5 wireless"),
+        ("DeLonghi Magnifica S ECAM22.110.B", "DeLonghi", "Espressor DeLonghi Magnifica S ECAM 22.110.B"),
+        ("Bosch Serie 4 WAN28263BY", "Bosch", "Masina de spalat Bosch WAN28263BY, 8 kg, 1400 RPM, Clasa B"),
+        ("LEGO Technic 42143 Ferrari Daytona SP3", "LEGO", "LEGO Technic Ferrari Daytona SP3 42143, 18+"),
+        ("LEGO Technic 42143", "LEGO", "Set LEGO Technic 42143, 3778 piese, 18+"),
+        ("Samsung Galaxy S24 128GB", "Samsung", "Samsung Galaxy S24 128GB, garantie 24 luni"),
+    ],
+)
+def test_spaced_codes_and_spec_numbers_still_match(ours: str, brand: str, theirs: str) -> None:
+    result = score_match(Product(sku="x", name=ours, brand=brand), offer(theirs))
+    assert result.score >= THRESHOLD, result
+
+
+@pytest.mark.parametrize(
+    ("ours", "brand", "theirs"),
+    [
+        ("LG OLED55C3", "LG", "Televizor LG OLED 65C3, 164 cm, 4K"),
+        ("Samsung QE55Q80C", "Samsung", "Televizor Samsung QE 65Q80C, 163 cm"),
+        ("Sony WH-1000XM5", "Sony", "Sony WH 1000 XM4 wireless"),
+    ],
+)
+def test_spaced_codes_of_other_models_still_rejected(ours: str, brand: str, theirs: str) -> None:
+    assert score_match(Product(sku="x", name=ours, brand=brand), offer(theirs)).score < THRESHOLD
+
+
 # --------------------------------------------------------------------------- invariants
 
 

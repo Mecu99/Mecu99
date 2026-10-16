@@ -462,6 +462,8 @@ async def sitemap_urls(
 # --------------------------------------------------------------------------- sitemap ranking
 
 _EXTENSION = re.compile(r"\.(?:html?|php|aspx?|jsp)$")
+# Matcher signs that a URL names something other than the item itself.
+_OTHER_ITEM = ("accessory_penalty", "bundle_penalty", "condition_penalty")
 _ID_SUFFIX = re.compile(r"[-_](?:p|pd|pid|id|i|sku|prod)[-_]?\d+$")
 _LONG_ID = re.compile(r"^\d{5,}$")
 
@@ -491,9 +493,10 @@ def rank_sitemap_urls(
 ) -> list[str]:
     """The ``limit`` sitemap URLs whose slugs best match ``product``, scoring >= ``min_score``.
 
-    Slugs are scored with :func:`pricehunter.match.score_match` (so accessory, variant and spec
-    guards apply). A URL carrying our GTIN wins outright, one carrying our MPN ranks just below
-    it, and a shared model token adds 0.1.
+    Slugs are scored with :func:`pricehunter.match.score_match` (so variant and spec guards
+    apply, and slugs naming an accessory, bundle or used item are dropped). A URL carrying our
+    GTIN wins outright, one carrying our MPN ranks just below it, and a shared model token adds
+    0.1.
     """
     if limit <= 0 or not urls:
         return []
@@ -517,6 +520,8 @@ def rank_sitemap_urls(
         if not slug:
             continue
         result = score_match(product, ExtractedOffer(url=url, title=slug))
+        if any(key in result.details for key in _OTHER_ITEM):
+            continue  # "husa-...", "...-refurbished": our identifiers in it must not lift it
         score = result.score
         if result.reason == "title":  # no conflict found, so identifiers in the URL can lift it
             if len(mpn) >= 5 and mpn in compact:

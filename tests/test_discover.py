@@ -555,6 +555,16 @@ def test_rank_sitemap_urls_model_token_boost() -> None:
     assert rank_sitemap_urls(urls, sony, limit=5) == [f"{BASE}/sony-wh-1000xm5-headphones-black-123457"]
 
 
+def test_rank_sitemap_urls_drops_accessory_and_used_slugs_even_with_our_mpn() -> None:
+    sony = Product(sku="s", name="Sony WH-1000XM5 Headphones Black", brand="Sony", mpn="WH1000XM5B")
+    urls = [
+        f"{BASE}/husa-sony-wh1000xm5b-123458",
+        f"{BASE}/sony-wh1000xm5b-headphones-black-refurbished-123459",
+        f"{BASE}/sony-wh-1000xm5-headphones-black-123457",
+    ]
+    assert rank_sitemap_urls(urls, sony, limit=5) == [f"{BASE}/sony-wh-1000xm5-headphones-black-123457"]
+
+
 # --------------------------------------------------------------------------- discover_candidates
 
 

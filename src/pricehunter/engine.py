@@ -15,6 +15,7 @@ from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from .alerts import dispatch, evaluate_alerts
@@ -41,6 +42,7 @@ from .models import (
     Settings,
     utcnow,
 )
+from .money import convert
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -49,6 +51,9 @@ Progress = Callable[[str], None]
 
 PINNED = MatchResult(score=1.0, reason="pinned")
 MAX_MATCHES_PER_PAIR = 2  # allows a second variant listing without letting noise in
+IDENTIFIED = frozenset({"gtin", "mpn"})  # match reasons that pin down the exact item
+# A new title-only match priced under this share of ours is likelier a part than a bargain.
+MIN_PLAUSIBLE_PRICE_RATIO = Decimal("0.4")
 MATCH_LOST = "match lost"
 NO_PRICE = "no price found (check the competitor's selectors)"
 _GONE = frozenset({404, 410})
@@ -161,10 +166,26 @@ def _needs_discovery(
     return last is None or utcnow() - last > max_age
 
 
+def _implausibly_cheap(
+    settings: Settings, product: Product, offer: ExtractedOffer, match: MatchResult
+) -> bool:
+    """A title-only match far below our price: an accessory or spare part the matcher missed
+    would otherwise set the market low and raise false undercut alerts."""
+    if match.reason != "title" or offer.price is None or not product.our_price:
+        return False
+    rates, base = settings.currency_rates, settings.base_currency
+    price = convert(offer.price, offer.currency, product.currency, rates, base)
+    return price is not None and price < product.our_price * MIN_PLAUSIBLE_PRICE_RATIO
+
+
 async def _discover(
     run: _Run, product: Product, competitor: Competitor, listings: list[Listing]
 ) -> None:
-    """Find candidate pages, keep the best matches as listings and remember when we looked."""
+    """Find candidate pages, keep the best matches as listings and remember when we looked.
+
+    Once a GTIN or MPN pins the exact item down, title-only look-alikes (a used unit, another
+    variant) are not kept next to it.
+    """
     settings = run.settings
     listed = {listing.url for listing in listings}
     candidates = await discover_candidates(
@@ -172,18 +193,28 @@ async def _discover(
     )
     run.say(f"{competitor.name}: {len(candidates)} candidate(s) for {product.sku}")
 
-    async def check(url: str) -> tuple[MatchResult, str] | None:
+    async def check(url: str) -> tuple[MatchResult, str, ExtractedOffer] | None:
         result = await run.get(url, competitor)
         run.stats.candidates_checked += 1
         if not result.ok or result.final_url in listed:
             return None
-        return score_match(product, _extract(result, competitor)), result.final_url
+        offer = _extract(result, competitor)
+        return score_match(product, offer), result.final_url, offer
 
     checked = await asyncio.gather(*(check(url) for url in candidates if url not in listed))
     best: dict[str, MatchResult] = {}
-    for match, url in sorted(filter(None, checked), key=lambda c: -c[0].score):
-        if match.score >= settings.match_threshold and url not in best:
-            best[url] = match
+    for match, url, offer in sorted(filter(None, checked), key=lambda c: -c[0].score):
+        if match.score < settings.match_threshold or url in best:
+            continue
+        if _implausibly_cheap(settings, product, offer, match):
+            price = f"{offer.price} {offer.currency or ''}".strip()
+            run.say(f"{competitor.name}: skipped {url} for {product.sku}: {price} is too cheap")
+            continue
+        best[url] = match
+    if any(m.reason in IDENTIFIED for m in best.values()) or any(
+        listing.match_reason in IDENTIFIED for listing in listings
+    ):
+        best = {url: match for url, match in best.items() if match.reason in IDENTIFIED}
     room = MAX_MATCHES_PER_PAIR - sum(1 for listing in listings if not listing.pinned)
     for url, match in list(best.items())[: max(room, 0)]:
         run.storage.upsert_listing(

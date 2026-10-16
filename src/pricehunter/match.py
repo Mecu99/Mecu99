@@ -2,7 +2,9 @@
 
 Identifiers win when both sides carry them (GTIN, then MPN). Otherwise a fuzzy title score is
 adjusted by guards against the classic wrong-variant matches: different storage or pack sizes,
-different model numbers, "Pro"/"Max" siblings, and accessories sold *for* the product.
+sibling model numbers and generations ("3S" vs "3", "Series X" vs "S", "Mark II"), "Pro"/"Max"
+and Wi-Fi/cellular siblings, bundles, used or refurbished items, and accessories or spare parts
+sold *for* the product. Keyword guards cover EN/RO/DE/FR/ES/IT/PL shop titles.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import unicodedata
 from collections.abc import Iterable
 from decimal import Decimal
 from functools import lru_cache
+from itertools import pairwise
 
 from rapidfuzz import fuzz
 
@@ -74,7 +77,12 @@ _UNIT_ALIASES: dict[str, str] = {
     "mm": "mm", "cm": "cm", "m": "m",
     "mp": "mp", "mpx": "mp",
     "pcs": "pcs", "pc": "pcs", "buc": "pcs", "bucati": "pcs", "piece": "pcs", "pieces": "pcs",
-    "pack": "pcs", "pk": "pcs", "%": "pct",
+    "pack": "pcs", "pk": "pcs", "piese": "pcs", "stuck": "pcs", "stk": "pcs", "szt": "pcs",
+    "pezzi": "pcs", "sticle": "pcs", "doze": "pcs", "bottles": "pcs", "cans": "pcs",
+    # Speeds and durations, so "1400 RPM" or "garantie 24 luni" never pass for model numbers.
+    "rpm": "rpm", "h": "h", "hrs": "h", "hours": "h", "ore": "h", "min": "min",
+    "luni": "mo", "months": "mo", "ani": "yr", "years": "yr",
+    "%": "pct",
 }  # fmt: skip
 _CANONICAL_UNITS = frozenset(_UNIT_ALIASES.values()) | {"x"}
 
@@ -86,7 +94,12 @@ def _alternation(words: Iterable[str]) -> str:
 _NUM = r"(?<![\w.,])(\d+(?:[.,]\d+)?)"
 _END = r"(?![a-z0-9])"
 _COMMA_NUM = re.compile(r"(?<![\w.,])\d+,\d+(?![\w,])")
-_PLUS = re.compile(r"(?<=[a-z0-9])\+(?![a-z0-9])")
+# "S24+", "Pro+" and "Note 10+" are "Plus" models; "..., 18+", "Ages 18+" or "8+ ani" are
+# age ratings.
+_PLUS = re.compile(
+    r"(?:\b([a-z0-9]*[a-z][a-z0-9]*)|(?<=[a-z] )(?<!age )(?<!ages )(?<!varsta )(\d+))"
+    r"\+(?![a-z0-9])(?!\s*(?:ani|years?|jahre|ans|anos|anni|lat)\b)"
+)
 _N_IN_1 = re.compile(r"(?<!\w)(\d)\s*-?\s*in\s*-?\s*1(?!\d)")
 _MULT_PREFIX = re.compile(r"(?<![\w.,])(\d+)\s*[x×*]\s*(?=\d)")
 _INCH_MARK = re.compile(_NUM + r"\s*(?:\"|''|′′|″|”|“)")
@@ -98,12 +111,32 @@ _CODE = re.compile(r"(?<![\w-])[a-z0-9]+(?:[-/][a-z0-9]+)+(?![\w-])")
 _PUNCT = re.compile(r"[^\w.]+|_")
 _LOOSE_DOT = re.compile(r"(?<!\d)\.|\.(?!\d)")
 _SPEC_TOKEN = re.compile(r"(\d+(?:\.\d+)?)(" + _alternation(_CANONICAL_UNITS) + r")")
+_GEN_WORD = r"(?:gen|generation|generatia|generatie|generacion|generazione|generacja|generacji)"
+# "2nd generation", "2. Generation", "2e génération", "generatia a 2-a" -> "2".
+_GENERATION = re.compile(
+    rf"\b(\d{{1,2}})(?: ?(?:st|nd|rd|th|e|eme|er|re|a|o))? {_GEN_WORD}\b"
+    rf"|\b{_GEN_WORD} (?:a )?(\d{{1,2}})(?: a)?\b"
+)
+_ROMAN = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "viii": "8", "ix": "9"}
+# Generations after "Mark"/"Mk" or a model number: "Mark II", "Mk2", "A7 IV", "RX100 VII".
+_ROMAN_GEN = re.compile(
+    rf"\b(?:mark|mk) ?({_alternation(_ROMAN)}|\d{{1,2}})\b"
+    rf"|\b([a-z]*\d[a-z0-9]*) ({_alternation(_ROMAN)})\b"
+)
+# Letters NFKD leaves alone ("szkło", "ładowarka").
+_UNDECOMPOSED = str.maketrans("łŁđĐøØ", "lLdDoO")
 
 
 def _fold(text: str) -> str:
     """Casefold and strip diacritics (NFKD), so "Mașină" and "masina" compare equal."""
-    decomposed = unicodedata.normalize("NFKD", text)
+    decomposed = unicodedata.normalize("NFKD", text.translate(_UNDECOMPOSED))
     return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
+
+
+def _roman_repl(m: re.Match[str]) -> str:
+    if m[1]:
+        return f"mark {_ROMAN.get(m[1], m[1])}"
+    return f"{m[2]} {_ROMAN[m[3]]}"
 
 
 def _canon_number(raw: str) -> str:
@@ -151,11 +184,13 @@ def normalize_text(text: str) -> str:
     Lowercases, strips diacritics, glues numbers to units (``"128 GB"`` -> ``"128gb"``,
     ``'6.1"'`` -> ``"6.1in"``, ``"0,5 L"`` -> ``"0.5l"``), writes pack multipliers as ``"6x"``
     (``"6 x 0.5 l"`` and ``"0.5 l x 6"`` both give ``"6x 0.5l"``-style tokens), glues hyphenated
-    model codes, turns a trailing ``+`` into ``plus``, maps Romanian colour names to English and
-    collapses all other punctuation to single spaces.
+    model codes, turns a model's trailing ``+`` into ``plus`` (``"S24+"``, not the age mark
+    ``"18+"``), writes generations as numbers (``"2nd generation"`` -> ``"2"``, ``"Mark II"`` ->
+    ``"mark 2"``, ``"A7 IV"`` -> ``"a7 4"``), maps Romanian colour names to English and collapses
+    all other punctuation to single spaces.
     """
     s = _fold(text)
-    s = _PLUS.sub(" plus", s)
+    s = _PLUS.sub(lambda m: f"{m[1] or m[2]} plus", s)
     s = _N_IN_1.sub(r"\1in1", s)
     s = _MULT_PREFIX.sub(r"\1x ", s)
     s = _INCH_MARK.sub(lambda m: _canon_number(m[1]) + "in ", s)
@@ -164,7 +199,9 @@ def normalize_text(text: str) -> str:
     s = _COMMA_NUM.sub(lambda m: _canon_number(m[0]), s)
     s = _CODE.sub(_code_repl, s)
     s = _LOOSE_DOT.sub(" ", _PUNCT.sub(" ", s))
-    return " ".join(_COLOURS.get(w, w) for w in s.split())
+    s = " ".join(_COLOURS.get(w, w) for w in s.split())
+    s = _GENERATION.sub(lambda m: m[1] or m[2], s)
+    return _ROMAN_GEN.sub(_roman_repl, s)
 
 
 @lru_cache(maxsize=8192)
@@ -225,7 +262,7 @@ def _spec_conflicts(a: str, b: str) -> list[str]:
 # --------------------------------------------------------------------------- model numbers
 
 _CHUNK = re.compile(r"[a-z0-9]+(?:[-/_][a-z0-9]+)*")
-_UNITS_RE = _alternation(set(_UNIT_ALIASES) | {"x"})
+_UNITS_RE = _alternation(set(_UNIT_ALIASES) | _CANONICAL_UNITS)
 # Quantities, not model numbers: "128gb", "6x2l", "1920x1080", "4k", "1080p".
 _UNIT_LIKE = re.compile(
     rf"(?:\d+(?:\.\d+)?x)?\d+(?:\.\d+)?(?:{_UNITS_RE})?|[1-9]\d?k|\d{{3,4}}[pi]"
@@ -291,38 +328,159 @@ def _respelled(token: str, other_compact: str) -> bool:
     return "." in token and len(plain) >= 5 and plain in other_compact
 
 
-def _number_conflict(a: str, b: str) -> bool:
-    """Same-shaped numeric tokens that differ: "iphone 15" vs "iphone 14", "s24" vs "s23"."""
+_ORDINALS = frozenset({"st", "nd", "rd", "th"})
+# Lone letters that name a model ("Series X", "Vitamin C"), unlike the one-letter words of
+# the supported languages ("a", "e", "i", "o", "u", "y", "w", "z").
+_MODEL_LETTERS = frozenset("bcdfghjklmnpqrstvx")
+
+
+def _suffixed(number: str, token: str) -> bool:
+    """``token`` is the bare ``number`` plus a model letter: "3s", "7x", "8a", "14t" (not "4k",
+    "5g", "2nd", which are units, resolutions or ordinals)."""
+    suffix = token[len(number) :]
+    return (
+        number.isdigit()
+        and token.startswith(number)
+        and suffix.isalpha()
+        and len(suffix) <= 2
+        and suffix not in _ORDINALS
+        and (suffix == "x" or not _UNIT_LIKE.fullmatch(token))
+    )
+
+
+def _letter_slots(text: str) -> set[tuple[str, str]]:
+    return {(prev, w) for prev, w in pairwise(text.split()) if w in _MODEL_LETTERS}
+
+
+def _model_conflict(a: str, b: str) -> bool:
+    """Sibling model numbers: same-shaped numbers that differ ("iphone 15" vs "iphone 14",
+    "s24" vs "s23", "airpods pro 2" vs "1" once generations are numbers), a model letter on
+    one side only ("3s" vs "3", "7x" vs "7") or another lone letter after the same word
+    ("series x" vs "series s")."""
     na = {t for t in a.split() if any(c.isdigit() for c in t)}
     nb = {t for t in b.split() if any(c.isdigit() for c in t)}
     ca, cb = re.sub(r"[\s.]", "", a), re.sub(r"[\s.]", "", b)
-    only_b = {_shape(t) for t in nb - na if not _respelled(t, ca)}
-    return any(_shape(t) in only_b for t in na - nb if not _respelled(t, cb))
+    only_a = {t for t in na - nb if not _respelled(t, cb)}
+    only_b = {t for t in nb - na if not _respelled(t, ca)}
+    if {_shape(t) for t in only_a} & {_shape(t) for t in only_b}:
+        return True
+    if any(_suffixed(x, y) or _suffixed(y, x) for x in only_a for y in only_b):
+        return True
+    sa, sb = _letter_slots(a), _letter_slots(b)
+    return any(p == q and x != y for p, x in sa - sb for q, y in sb - sa)
+
+
+def _codes(norm: str) -> set[str]:
+    """Model-code words of normalized text, dotted ones included ("ecam22.110")."""
+    return {w for w in norm.split() if _is_model(w)}
+
+
+def _glue_codes(text: str, codes: Iterable[str]) -> tuple[str, set[str]]:
+    """Rejoin model codes a shop wrote with spaces ("qe 55q80c", "wh 1000 xm5") into the
+    spelling the other side uses, returning the text and the codes found that way."""
+    wanted, words = set(codes), text.split()
+    out: list[str] = []
+    found: set[str] = set()
+    i = 0
+    while i < len(words):
+        for j in range(i + 2, min(i + 4, len(words)) + 1):
+            if (joined := "".join(words[i:j])) in wanted:
+                out.append(joined)
+                found.add(joined)
+                i = j
+                break
+        else:
+            out.append(words[i])
+            i += 1
+    return " ".join(out), found
 
 
 # --------------------------------------------------------------------------- guards
 
-_VARIANT_WORDS = frozenset({"pro", "max", "plus", "ultra", "mini", "lite", "light", "se", "fe", "zero"})
+# Sibling words: "Pro"/"Max" models, "Mark II" generations, OLED and cellular editions.
+_VARIANT_WORDS = frozenset(
+    {"pro", "max", "plus", "ultra", "mini", "lite", "light", "se", "fe", "zero", "mark", "oled",
+     "cellular", "edition"}
+)  # fmt: skip
 # Phrases where a variant word describes a feature, not a sibling model.
 _NOT_A_VARIANT = re.compile(
     r"\b(?:ultra hd|ultra high definition|mini (?:usb|hdmi|jack|displayport|dp)|plus size)\b"
 )
+_CELLULAR = re.compile(r"\b(?:cellular|lte|[345]g)\b")
+_DUAL_BAND = re.compile(r"\b(?:2\.4g(?:hz)? 5g(?:hz)?|5g(?:hz)? 2\.4g(?:hz)?)\b")  # Wi-Fi bands
+_WIFI = re.compile(r"\b(?:wi ?fi|wlan)\b")
+
+# Accessories and spare parts, wherever the title names them: a case is never the phone.
 _ACCESSORY = re.compile(
-    r"\b(?:husa|huse|case|cases|cover|covers|carcasa|bumper|charger|chargers|incarcator\w*"
-    r"|cable|cables|cablu\w*|adapter|adaptor|screen protector|tempered glass|sticla securizata"
-    r"|folie|folii|strap|straps|curea|curele|replacement|spare|compatib\w*|refurbished|refurb"
-    r"|renewed|resigilat\w*|reconditionat\w*|used|second hand|open box|bundle)\b"
+    r"\b(?:husa|huse|case|cases|cover|covers|carcasa|bumper|etui|(?:schutz)?hulle\w*|coque\w*"
+    r"|housse\w*|funda|fundas|custodia|pokrowiec\w*"
+    r"|screen protector|tempered glass|sticla securizata|folie|folii|folia|panzerglas\w*"
+    r"|schutzfolie\w*|displayschutz\w*|verre trempe|protector de pantalla|cristal templado"
+    r"|vetro temperato|pellicola|szklo hartowane|szklo ochronne"
+    r"|charger|chargers|incarcator\w*|ladegerat\w*|ladekabel|netzteil|chargeur\w*|cargador\w*"
+    r"|caricabatteri\w*|ladowark\w*|cable|cables|cablu\w*|kabel|cavo|adapter|adaptor"
+    r"|strap|straps|curea|curele|correa|cinturino|pernute|ohrpolster|ear ?pads?|ear ?tips?"
+    r"|ear ?cushions?|coussinets|almohadillas|cuscinetti"
+    r"|replacement|spare|ersatz\w*|repuestos?|recambios?|ricambi\w*|zamiennik\w*"
+    r"|piese de schimb|pieces? detachees?|compatib\w*|kompatib\w*)\b"
 )
-# "for"/"pentru" are common words; they only signal an accessory when followed by the product.
-_FOR = re.compile(r"\b(?:for|pentru)\s+(\w+)")
+# Accessory words that are part of the product itself (earbuds, watches).
+_NOT_AN_ACCESSORY = re.compile(
+    r"\b(?:charging case|(?:aluminium|aluminum|steel|titanium) case|carcasa de incarcare)\b"
+)
+# Nouns that make the title a part or an add-on only when they lead it ("Acumulator Dyson
+# V15", "Dock Nintendo Switch"); further on they are specs ("..., 60 min battery, HEPA filter").
+_PART_HEADS = frozenset({
+    "battery", "batteries", "akku", "acumulator", "acumulatori", "baterie", "baterii",
+    "batterie", "bateria", "batteria", "akumulator", "filter", "filters", "filtru", "filtre",
+    "filtro", "filtri", "filtr", "brush", "perie", "perii", "burste", "brosse", "cepillo",
+    "spazzola", "szczotka", "dock", "docking", "suport", "halterung", "support", "soporte",
+    "supporto", "uchwyt", "bag", "geanta", "tasche", "sacoche", "bolsa", "borsa", "torba",
+    "rucsac", "backpack", "rucksack", "controller", "gamepad", "maneta", "telecomanda",
+    "fernbedienung", "telecommande", "mando", "telecomando", "joc", "spiel", "jeu", "juego",
+    "gioco", "gra", "capac", "rezerva", "rezerve", "capete", "lame", "piesa", "piese",
+})  # fmt: skip
+# "for"/"pentru"/"für"... are common words; they only signal an accessory when followed by
+# the product.
+_FOR = re.compile(r"\b(?:for|pentru|fur|pour|para|per|dla)\s+(\w+)")
+
+# Bundles and multipacks sell more than the product (a multipack of ours may name them too).
+# Not "set": LEGO sets, pan sets and "Set de constructie" are products in their own right.
+_PACK_WORDS = re.compile(r"\b(?:bundle|pachet|bax|multipack|kit|combo)\b")
+# "+ 2 jocuri", "+ RF 24-105mm": something added, unlike "GPS + Cellular".
+_BUNDLE_PLUS = re.compile(
+    r"(?:^|\s)\+\s*(?!(?:wi-?fi|wlan|bluetooth|bt|nfc|gps|lte|cellular|[2-5]g)\b)[^\W_]"
+)
+
+# Used, refurbished, open-box and demo goods: the same model, sold cheaper.
+_CONDITION = re.compile(
+    r"\b(?:used|pre ?owned|second ?hand|2nd hand|refurb\w*|renewed|reconditioned"
+    r"|remanufactured|recertified|open ?box|ex display|ex demo|demo|display model|like new"
+    r"|b stock|b ware|grade? [a-d]"
+    r"|resigilat\w*|reconditionat\w*|reinnoit\w*|folosit[ae]?|ca noua?|expus"
+    r"|gebraucht\w*|generaluberholt\w*|wie neu|neuwertig\w*|vorfuhrgerat|ausstellungsstuck|retoure"
+    r"|reconditionne\w*|remis a neuf|d occasion|comme neuf"
+    r"|reacondicionad[oa]s?|seminuev[oa]s?|usad[oa]s?|renovad[oa]s?|como nuevo|segunda mano"
+    r"|ricondizionat[oaie]|rigenerat[oaie]|usat[oaie]|come nuovo|seconda mano"
+    r"|odnowion\w*|uzywan\w*|powystawow\w*|jak nowy|uszkodzon\w* opakowani\w*"
+    r"|damaged (?:box|packaging)|repasovan\w*|felujitott|hasznalt)\b"
+)
 
 
 def _accessory_terms(text: str, anchors: frozenset[str]) -> set[str]:
-    """Accessory/condition keywords, plus ``"for"`` when the text is *for* something: it says
+    """Accessory/spare-part keywords, plus ``"for"`` when the text is *for* something: it says
     "for <one of our product's words>" or names an accessory (a case is always for a phone)."""
+    text = _NOT_AN_ACCESSORY.sub(" ", text)
     terms = set(_ACCESSORY.findall(text))
     if terms or any(w in anchors for w in _FOR.findall(text)):
         terms.add("for")
+    return terms
+
+
+def _bundle_terms(norm: str, raw: str) -> set[str]:
+    terms = set(_PACK_WORDS.findall(norm))
+    if _BUNDLE_PLUS.search(_fold(raw)):
+        terms.add("+")
     return terms
 
 
@@ -332,12 +490,17 @@ def _anchors(norm: str, raw: str, brand: str | None) -> frozenset[str]:
 
 
 def _variant_mismatch(a: str, b: str) -> set[str]:
-    """Variant words ("pro", "max", ...) present on one side only, ignoring compounds
-    like "airfryer" vs "air fryer" by checking the other side with spaces removed."""
+    """Variant words ("pro", "max", "oled", ...) present on one side only, ignoring compounds
+    like "airfryer" vs "air fryer" by checking the other side with spaces removed, plus
+    ``"cellular"`` when one side is a 5G/LTE model and the other says Wi-Fi only."""
     a, b = _NOT_A_VARIANT.sub(" ", a), _NOT_A_VARIANT.sub(" ", b)
     ta, tb = set(a.split()), set(b.split())
     ca, cb = a.replace(" ", ""), b.replace(" ", "")
-    return {w for w in (ta ^ tb) & _VARIANT_WORDS if w not in (cb if w in ta else ca)}
+    words = {w for w in (ta ^ tb) & _VARIANT_WORDS if w not in (cb if w in ta else ca)}
+    cell_a, cell_b = (bool(_CELLULAR.search(_DUAL_BAND.sub(" ", t))) for t in (a, b))
+    if cell_a != cell_b and _WIFI.search(b if cell_a else a):
+        words.add("cellular")
+    return words
 
 
 def _contains(haystack: str, needle: str) -> bool:
@@ -407,9 +570,10 @@ def score_match(product: Product, offer: ExtractedOffer) -> MatchResult:
 
     1. GTINs on both sides decide alone: equal -> 1.0 ``gtin``; different -> 0.05 ``gtin_conflict``.
     2. Equal MPNs (same or unknown brand) -> 0.97 ``mpn`` unless the specs disagree.
-    3. Otherwise a fuzzy title score with penalties for a missing brand, accessories and variant
-       words, a bonus for a shared model number, and caps for conflicting model numbers
-       (``model_conflict``), specs (``spec_conflict``) or MPNs (``mpn_conflict``).
+    3. Otherwise a fuzzy title score with penalties for a missing brand, accessories or spare
+       parts, bundles, used/refurbished condition and variant words, a bonus for a shared model
+       number, and caps for conflicting model numbers or generations (``model_conflict``),
+       specs (``spec_conflict``) or MPNs (``mpn_conflict``).
     """
     pg, og = normalize_gtin(product.gtin), normalize_gtin(offer.gtin)
     if pg and og:
@@ -420,6 +584,10 @@ def score_match(product: Product, offer: ExtractedOffer) -> MatchResult:
     p_raw, p_text = _compose(product.brand, product.name, product.mpn)
     # Their MPN only adds noise to the title comparison when we have none to compare it with.
     o_raw, o_text = _compose(offer.brand, offer.title, offer.mpn if product.mpn else None)
+    pt, ot = _model_tokens(p_raw), _model_tokens(f"{o_raw} {offer.mpn or ''}")
+    o_text, glued = _glue_codes(o_text, pt | _codes(p_text))
+    p_text, glued_ours = _glue_codes(p_text, ot | _codes(o_text))
+    pt, ot = pt | glued_ours, ot | glued
     spec_conflicts = _spec_conflicts(p_text, o_text)
 
     pm, om = _norm_mpn(product.mpn), _norm_mpn(offer.mpn)
@@ -432,7 +600,6 @@ def score_match(product: Product, offer: ExtractedOffer) -> MatchResult:
 
     details = title_similarity(p_text, o_text)
     score, reason = details["title"], "title"
-    pt, ot = _model_tokens(p_raw), _model_tokens(f"{o_raw} {offer.mpn or ''}")
     model_clash = bool(pt and ot and not _tokens_overlap(pt, ot))
     if pt and ot and not model_clash:
         score = min(1.0, score + 0.1)
@@ -447,14 +614,34 @@ def score_match(product: Product, offer: ExtractedOffer) -> MatchResult:
         score *= 0.75
         details["brand_penalty"] = 0.75
     anchors = _anchors(p_text, p_raw, product.brand)
-    if _accessory_terms(o_text, anchors) - _accessory_terms(p_text, anchors):
+    ours = p_text.split()
+    head = normalize_text(offer.title or "").partition(" ")[0]
+    if (_accessory_terms(o_text, anchors) - _accessory_terms(p_text, anchors)) or (
+        head in _PART_HEADS and head not in ours
+    ):
         score *= 0.6
         details["accessory_penalty"] = 0.6
-    if _variant_mismatch(p_text, o_text):
+    bundle = _bundle_terms(o_text, o_raw) - _bundle_terms(p_text, p_raw)
+    if any(n > 1 for n in _canonical_specs(p_text).get("pcs", ())):
+        bundle &= {"+"}  # we sell a multipack ourselves; the pack sizes are compared as specs
+    if {w for w in bundle if w not in "".join(ours)}:  # "kit" is no bundle of our "KitKat"
+        score *= 0.6
+        details["bundle_penalty"] = 0.6
+    if _CONDITION.search(o_text) and not _CONDITION.search(p_text):
+        score *= 0.6
+        details["condition_penalty"] = 0.6
+    # A full model code on both sides ("WAN28263BY", not a family name like "HERO12") names the
+    # exact model: variant words are then just how a shop describes it ("Samsung OLED QE55S95C"),
+    # and a long shop title around it is no reason to doubt a match nothing else argues against.
+    same_code = any(len(t) >= 6 and sum(c.isdigit() for c in t) >= 3 for t in pt & ot)
+    if not same_code and _variant_mismatch(p_text, o_text):
         score *= 0.7
         details["variant_penalty"] = 0.7
+    if same_code and not any(k.endswith("_penalty") for k in details):
+        score = max(score, 0.9)
+        details["same_code"] = 1.0
 
-    if model_clash or _number_conflict(p_text, o_text):
+    if model_clash or _model_conflict(p_text, o_text):
         score = min(score, 0.45)
         reason = "model_conflict"
         details["model_conflict"] = 1.0
